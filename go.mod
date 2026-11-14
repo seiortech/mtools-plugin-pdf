@@ -1,10 +1,12 @@
 module github.com/seiortech/mtools-plugin-pdf
 
-go 1.26.0
+go 1.27.3
 
 require (
+	github.com/egoist/mygo v0.8.3
 	github.com/pdfcpu/pdfcpu v0.16.4
 	github.com/seiortech/mtools-sdk v0.1.0
+	github.com/seiortech/mtools-sdk/ui v0.1.0
 )
 
 require (
@@ -16,4 +18,9 @@ require (
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/image v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
+)
+
+replace (
+	github.com/seiortech/mtools-sdk => ../mtools-sdk
+	github.com/seiortech/mtools-sdk/ui => ../mtools-sdk/ui
 )

@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "code": "en",
+    "name": "English",
+    "author": "mtools Team"
+  },
+  "strings": {
+    "pdf.name": "PDF Utility",
+    "pdf.desc": "Merge, split, extract, and convert images & office files to PDF.",
+    "pdf.workbench": "PDF Workbench",
+    "pdf.tab_merge": "MERGE",
+    "pdf.tab_split": "SPLIT",
+    "pdf.tab_image": "IMAGE TO PDF",
+    "pdf.tab_office": "OFFICE TO PDF",
+    "pdf.add_files": "Add Files",
+    "pdf.clear_all": "Clear All",
+    "pdf.drop_files": "Drop PDF files here, or click to browse",
+    "pdf.drop_images": "Drop images here (PNG, JPEG, WebP, TIFF)",
+    "pdf.drop_office": "Drop Word, Excel, or PowerPoint documents here",
+    "pdf.single_pdf": "Select a single PDF file to split",
+    "pdf.run_merge": "Merge PDFs",
+    "pdf.run_split": "Split PDF",
+    "pdf.run_image": "Convert to PDF",
+    "pdf.run_office": "Convert Document",
+    "pdf.libreoffice_warning": "LibreOffice executable not found. Office conversion requires LibreOffice installed on this computer."
+  }
+}

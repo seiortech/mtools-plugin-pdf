@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "code": "id",
+    "name": "Bahasa Indonesia",
+    "author": "mtools Team"
+  },
+  "strings": {
+    "pdf.name": "Utilitas PDF",
+    "pdf.desc": "Gabung, pisah, ekstrak, dan konversi gambar & berkas kantor ke PDF.",
+    "pdf.workbench": "Meja Kerja PDF",
+    "pdf.tab_merge": "GABUNG",
+    "pdf.tab_split": "PISAH",
+    "pdf.tab_image": "GAMBAR KE PDF",
+    "pdf.tab_office": "OFFICE KE PDF",
+    "pdf.add_files": "Tambah Berkas",
+    "pdf.clear_all": "Hapus Semua",
+    "pdf.drop_files": "Tarik berkas PDF ke sini, atau klik untuk mencari",
+    "pdf.drop_images": "Tarik gambar ke sini (PNG, JPEG, WebP, TIFF)",
+    "pdf.drop_office": "Tarik dokumen Word, Excel, atau PowerPoint ke sini",
+    "pdf.single_pdf": "Pilih satu berkas PDF untuk dipisahkan",
+    "pdf.run_merge": "Gabung PDF",
+    "pdf.run_split": "Pisah PDF",
+    "pdf.run_image": "Konversi ke PDF",
+    "pdf.run_office": "Konversi Dokumen",
+    "pdf.libreoffice_warning": "Executable LibreOffice tidak ditemukan. Konversi Office membutuhkan LibreOffice yang terpasang di komputer ini."
+  }
+}
