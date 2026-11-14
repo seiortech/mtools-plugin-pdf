@@ -1,0 +1,156 @@
+{
+  "schema": 1,
+  "tools": [
+    {
+      "id": "pdf",
+      "modes": [
+        {
+          "id": "merge",
+          "label": "Merge PDFs",
+          "fields": ["files", "output_file"],
+          "action": "merge"
+        },
+        {
+          "id": "split",
+          "label": "Split PDF",
+          "fields": ["split_file", "split_span", "output_dir"],
+          "action": "split"
+        },
+        {
+          "id": "extract",
+          "label": "Extract Pages",
+          "fields": ["extract_file", "pages", "output_file"],
+          "action": "extract"
+        },
+        {
+          "id": "images",
+          "label": "Images to PDF",
+          "fields": ["image_files", "output_file"],
+          "action": "images"
+        },
+        {
+          "id": "office",
+          "label": "Office to PDF",
+          "fields": ["office_file", "output_dir"],
+          "action": "office"
+        }
+      ],
+      "fields": [
+        {
+          "id": "files",
+          "kind": "files",
+          "label": "Input PDF Files",
+          "required": true
+        },
+        {
+          "id": "split_file",
+          "kind": "files",
+          "label": "Input PDF File",
+          "required": true
+        },
+        {
+          "id": "split_span",
+          "kind": "text",
+          "label": "Page Span",
+          "default": "1",
+          "required": true
+        },
+        {
+          "id": "extract_file",
+          "kind": "files",
+          "label": "Input PDF File",
+          "required": true
+        },
+        {
+          "id": "pages",
+          "kind": "text",
+          "label": "Page Ranges",
+          "required": true
+        },
+        {
+          "id": "image_files",
+          "kind": "files",
+          "label": "Image Files",
+          "required": true
+        },
+        {
+          "id": "office_file",
+          "kind": "files",
+          "label": "Office Document",
+          "required": true
+        },
+        {
+          "id": "output_file",
+          "kind": "text",
+          "label": "Output File Path",
+          "required": true
+        },
+        {
+          "id": "output_dir",
+          "kind": "directory",
+          "label": "Output Directory",
+          "required": true
+        }
+      ],
+      "actions": [
+        {
+          "id": "merge",
+          "label": "Merge PDFs",
+          "inputs": ["files", "output_file"]
+        },
+        {
+          "id": "split",
+          "label": "Split PDF",
+          "inputs": ["split_file", "split_span", "output_dir"]
+        },
+        {
+          "id": "extract",
+          "label": "Extract Pages",
+          "inputs": ["extract_file", "pages", "output_file"]
+        },
+        {
+          "id": "images",
+          "label": "Convert Images to PDF",
+          "inputs": ["image_files", "output_file"]
+        },
+        {
+          "id": "office",
+          "label": "Convert Office to PDF",
+          "inputs": ["office_file", "output_dir"]
+        }
+      ],
+      "helpers": [
+        {
+          "id": "soffice",
+          "name": "LibreOffice",
+          "description": "Required for converting Office documents to PDF",
+          "install_url": "https://www.libreoffice.org"
+        }
+      ],
+      "settings": [
+        {
+          "id": "output_dir",
+          "kind": "directory",
+          "label": "Default Output Folder",
+          "description": "Destination folder for generated and converted PDF files.",
+          "default": "~/Downloads",
+          "required": true
+        },
+        {
+          "id": "soffice_path",
+          "kind": "file",
+          "label": "LibreOffice executable path",
+          "description": "Custom soffice path for Office to PDF conversions. Leave empty to auto-detect.",
+          "placeholder": "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+          "default": "",
+          "action": {
+            "id": "get_libreoffice",
+            "label": "Get LibreOffice",
+            "description": "Open official LibreOffice download page in browser.",
+            "url": "https://www.libreoffice.org/download/download-libreoffice/"
+          }
+        }
+      ]
+    }
+  ]
+}

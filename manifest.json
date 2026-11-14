@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "id": "com.mtools.pdf",
+  "name": "PDF Utility",
+  "version": "1.0.0",
+  "description": "Merge, split, extract, and convert images & office files to PDF.",
+  "publisher": {
+    "name": "mtools Team"
+  },
+  "capabilities": ["process", "files.read", "files.write"],
+  "entry": {
+    "kind": "sidecar",
+    "path": "bin/tool",
+    "protocol": "jsonrpc-stdio-v1"
+  },
+  "tools": [
+    {
+      "id": "pdf",
+      "name": "PDF Utility",
+      "description": "Merge, split, extract, and convert images & office files to PDF.",
+      "category": "Document"
+    }
+  ]
+}
