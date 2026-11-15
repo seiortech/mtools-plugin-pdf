@@ -35,4 +35,7 @@ func TestPDFSurfacesValidation(t *testing.T) {
 	if len(doc.Tools) != 1 || len(doc.Tools[0].Modes) != 5 {
 		t.Fatalf("expected 1 tool with 5 modes, got %+v", doc.Tools)
 	}
+	if doc.Tools[0].Live == nil || !doc.Tools[0].Live.FullBleed {
+		t.Fatalf("expected full_bleed=true on pdf Live UI surface, got %+v", doc.Tools[0].Live)
+	}
 }

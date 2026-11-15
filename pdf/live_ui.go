@@ -4,55 +4,61 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	"image/png"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	pdfeng "github.com/seiortech/mtools-plugin-pdf/internal/pdf"
 	"github.com/seiortech/mtools-sdk/job"
 	"github.com/seiortech/mtools-sdk/pluginapi"
 	"github.com/seiortech/mtools-sdk/ui/i18n"
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/webp"
 )
 
 //go:embed locales/*.json
 var localesFS embed.FS
 
-// LiveUI implements pluginapi.LiveUI for PDF Utility, rendering inside the
-// main mtools window via UITree.
-type LiveUI struct {
-	mu      sync.Mutex
-	catalog *i18n.Catalog
-	lang    i18n.Lang
+const (
+	defaultPageW     = 595.0
+	defaultPageH     = 842.0
+	minZoomFactor    = 0.25
+	maxZoomFactor    = 3.0
+	defaultRailWidth = 320.0
+)
 
-	activeTab string // "merge", "split", "images", "office"
+type pageSize struct {
+	W float64
+	H float64
+}
 
-	// Merge
-	mergeFiles      []liveFileItem
-	mergeOutputName string
+type pageAssetKey struct {
+	sourcePath string
+	docGen     uint64
+	pageNum    int
+	scale1000  int
+}
 
-	// Split
-	splitFile       *liveFileItem
-	splitMode       string // "all" or "range"
-	splitPageRange  string
-	splitOutputName string
-
-	// Images
-	imageFiles      []liveFileItem
-	imageOutputName string
-
-	// Office
-	officeFiles []liveFileItem
-	sofficePath string
-
-	// Shared output & status
-	outputDir   string
-	inlineError string
-	running     bool
-	progress    float64
-	progressMsg string
-	resultMsg   string
+type previewPage struct {
+	Kind       string // "pdf" or "image"
+	SourcePath string
+	SourceName string
+	SourceIdx  int
+	PDFPage    int
+	GlobalPage int
+	W, H       float64
+	ImageAsset string
 }
 
 type liveFileItem struct {
@@ -60,21 +66,105 @@ type liveFileItem struct {
 	Name      string
 	SizeStr   string
 	PageCount int
+	PageSizes []pageSize
 	AssetRef  string
+	AssetFile string
+	ImgW      float64
+	ImgH      float64
+}
+
+// LiveUI implements pluginapi.LiveUI for PDF Utility as a full-bleed
+// Sage Garden workbench with native PDF & image page previews.
+type LiveUI struct {
+	mu       sync.Mutex
+	rev      uint64
+	catalog  *i18n.Catalog
+	lang     i18n.Lang
+	dataDir  string
+	history  *pdfeng.HistoryStore
+	renderer pdfeng.PageRenderer
+
+	activeTab string // "merge", "split", "images", "office"
+
+	// Merge
+	mergeFiles      []liveFileItem
+	mergeOutputName string
+
+	// Split / Extract
+	splitFile       *liveFileItem
+	splitMode       string // "all" or "range"
+	splitSpan       string
+	splitPageRange  string
+	splitOutputName string
+
+	// Images to PDF
+	imageFiles      []liveFileItem
+	imageOutputName string
+
+	// Office to PDF
+	officeFiles        []liveFileItem
+	officePreviewFiles []liveFileItem
+	sofficePath        string
+
+	// Preview & viewport state
+	docGen             uint64
+	previewPages       []previewPage
+	currentPage        int
+	zoom               float64
+	fitZoom            float64
+	viewportW          float64
+	viewportH          float64
+	viewportFromScroll bool
+	scrollY            float64
+	targetScrollY      float64
+	scrollSeq          uint64
+	railWidth          float32
+	railCollapsed      bool
+
+	// Page bitmap & asset cache
+	pageCache       *pdfeng.PageBitmapCache
+	pageAssets      map[pageAssetKey]string
+	pageAssetFiles  map[string]string
+	renderSem       chan struct{}
+	inFlightRenders map[pageAssetKey]bool
+	zoomDebounce    *time.Timer
+	assetSeq        int
+
+	// Output & job state
+	outputDir        string
+	inlineError      string
+	running          bool
+	progress         float64
+	progressMsg      string
+	resultMsg        string
+	resultOutputs    []string
+	resultAuthorized bool
+	jobCancel        context.CancelFunc
+	jobGen           uint64
 }
 
 // NewLiveUI creates a LiveUI instance for PDF Utility.
 func NewLiveUI() *LiveUI {
-	cat := i18n.NewCatalog()
-	_ = cat.LoadFS(localesFS, "locales")
+	cat, _ := i18n.NewCatalogFromFS(localesFS, "locales")
 	return &LiveUI{
 		catalog:         cat,
 		lang:            i18n.LangEN,
+		renderer:        pdfeng.DefaultRenderer(),
 		activeTab:       "merge",
 		mergeOutputName: "merged.pdf",
 		splitMode:       "all",
+		splitSpan:       "1",
 		splitOutputName: "extracted.pdf",
 		imageOutputName: "images.pdf",
+		currentPage:     1,
+		zoom:            1.0,
+		fitZoom:         1.0,
+		railWidth:       defaultRailWidth,
+		pageCache:       pdfeng.NewPageBitmapCache(48),
+		pageAssets:      make(map[pageAssetKey]string),
+		pageAssetFiles:  make(map[string]string),
+		renderSem:       make(chan struct{}, 2),
+		inFlightRenders: make(map[pageAssetKey]bool),
 	}
 }
 
@@ -89,12 +179,25 @@ func (u *LiveUI) t(key, fallback string) string {
 	return v
 }
 
+func (u *LiveUI) tf(key string, args ...any) string {
+	if u.catalog == nil {
+		return fmt.Sprintf(key, args...)
+	}
+	return u.catalog.Tf(u.lang, key, args...)
+}
+
 func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, session *pluginapi.UISession) (pluginapi.UITree, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
 	if params.Lang != "" {
 		u.lang = i18n.NormalizeLang(params.Lang)
+	}
+	if params.Viewport.Width > 0 {
+		u.viewportW = float64(params.Viewport.Width)
+	}
+	if params.Viewport.Height > 0 {
+		u.viewportH = float64(params.Viewport.Height)
 	}
 	if dir := params.Settings["output_dir"]; dir != "" {
 		u.outputDir = expandHome(dir)
@@ -109,39 +212,114 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 	} else if sp := params.Settings["helper_soffice"]; sp != "" {
 		u.sofficePath = sp
 	}
+	if u.dataDir == "" {
+		if dd := os.Getenv("MTOOLS_PLUGIN_DATA"); dd != "" {
+			u.dataDir = dd
+			u.history = pdfeng.NewHistoryStore(dd)
+		}
+	}
 
-	return u.buildTreeLocked(0), nil
+	return u.buildTreeLocked(), nil
 }
 
 func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginapi.UISession) error {
 	u.mu.Lock()
+	shouldRender := true
 	switch ev.Node {
 	case "pdf.tabs":
-		if ev.Kind == pluginapi.UIEventSelect && ev.Value != "" {
+		if ev.Kind == pluginapi.UIEventSelect && ev.Value != "" && ev.Value != u.activeTab {
 			u.activeTab = ev.Value
 			u.inlineError = ""
 			u.resultMsg = ""
+			u.resultOutputs = nil
+			u.resultAuthorized = false
+			u.rebuildPreviewLocked(session, true)
 		}
-	case "pdf.merge.pick":
+	case "pdf.main_split":
+		if ev.Kind == pluginapi.UIEventResize {
+			if w, err := strconv.Atoi(strings.TrimSpace(ev.Value)); err == nil && w >= 240 && w <= 560 {
+				u.railWidth = float32(w)
+				shouldRender = false
+			}
+		}
+	case "pdf.rail_toggle", "pdf.rail_expand":
+		if ev.Kind == pluginapi.UIEventClick {
+			u.railCollapsed = !u.railCollapsed
+		}
+	case "pdf.viewport":
+		switch ev.Kind {
+		case pluginapi.UIEventScroll:
+			shouldRender = u.handleViewportScrollLocked(ev.Value, session)
+		case pluginapi.UIEventZoom:
+			shouldRender = u.handleViewportZoomLocked(ev.Value, session)
+		default:
+			shouldRender = false
+		}
+	case "pdf.page_prev":
+		if ev.Kind == pluginapi.UIEventClick && u.currentPage > 1 {
+			u.jumpToPageLocked(u.currentPage-1, session)
+		}
+	case "pdf.page_next":
+		if ev.Kind == pluginapi.UIEventClick && u.currentPage < len(u.previewPages) {
+			u.jumpToPageLocked(u.currentPage+1, session)
+		}
+	case "pdf.zoom_out":
+		if ev.Kind == pluginapi.UIEventClick {
+			u.setZoomLocked(u.effectiveZoomLocked()/1.2, session)
+		}
+	case "pdf.zoom_in":
+		if ev.Kind == pluginapi.UIEventClick {
+			u.setZoomLocked(u.effectiveZoomLocked()*1.2, session)
+		}
+	case "pdf.zoom_fit":
+		if ev.Kind == pluginapi.UIEventClick {
+			u.fitZoomLocked(session)
+		}
+	case "pdf.merge.pick", "pdf.merge.empty_pick":
 		if ev.Kind == pluginapi.UIEventChange && ev.Value != "" {
 			for _, p := range splitPickedPaths(ev.Value) {
 				u.mergeFiles = append(u.mergeFiles, u.makeItemLocked(ctx, p, session, false))
 			}
 			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, false)
+		}
+	case "pdf.merge.clear":
+		if ev.Kind == pluginapi.UIEventClick && !u.running {
+			u.mergeFiles = nil
+			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, true)
 		}
 	case "pdf.merge.outname":
 		if ev.Kind == pluginapi.UIEventChange {
 			u.mergeOutputName = ev.Value
+			shouldRender = false
 		}
-	case "pdf.split.pick":
+	case "pdf.split.pick", "pdf.split.empty_pick":
 		if ev.Kind == pluginapi.UIEventChange && ev.Value != "" {
 			item := u.makeItemLocked(ctx, ev.Value, session, false)
 			u.splitFile = &item
 			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, true)
+		}
+	case "pdf.split.clear":
+		if ev.Kind == pluginapi.UIEventClick && !u.running {
+			u.splitFile = nil
+			u.splitPageRange = ""
+			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, true)
 		}
 	case "pdf.split.mode":
 		if ev.Kind == pluginapi.UIEventSelect && ev.Value != "" {
 			u.splitMode = ev.Value
+			u.inlineError = ""
+		}
+	case "pdf.split.span":
+		if ev.Kind == pluginapi.UIEventChange {
+			u.splitSpan = ev.Value
 		}
 	case "pdf.split.range":
 		if ev.Kind == pluginapi.UIEventChange {
@@ -150,37 +328,90 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 	case "pdf.split.outname":
 		if ev.Kind == pluginapi.UIEventChange {
 			u.splitOutputName = ev.Value
+			shouldRender = false
 		}
-	case "pdf.images.pick":
+	case "pdf.images.pick", "pdf.images.empty_pick":
 		if ev.Kind == pluginapi.UIEventChange && ev.Value != "" {
 			for _, p := range splitPickedPaths(ev.Value) {
 				u.imageFiles = append(u.imageFiles, u.makeItemLocked(ctx, p, session, true))
 			}
 			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, false)
+		}
+	case "pdf.images.clear":
+		if ev.Kind == pluginapi.UIEventClick && !u.running {
+			u.clearImageAssetsLocked(session)
+			u.imageFiles = nil
+			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, true)
 		}
 	case "pdf.images.outname":
 		if ev.Kind == pluginapi.UIEventChange {
 			u.imageOutputName = ev.Value
+			shouldRender = false
 		}
-	case "pdf.office.pick":
+	case "pdf.office.pick", "pdf.office.empty_pick":
 		if ev.Kind == pluginapi.UIEventChange && ev.Value != "" {
 			for _, p := range splitPickedPaths(ev.Value) {
 				u.officeFiles = append(u.officeFiles, u.makeItemLocked(ctx, p, session, false))
 			}
+			u.officePreviewFiles = nil
 			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, true)
+		}
+	case "pdf.office.clear":
+		if ev.Kind == pluginapi.UIEventClick && !u.running {
+			u.officeFiles = nil
+			u.officePreviewFiles = nil
+			u.inlineError = ""
+			u.resultMsg = ""
+			u.rebuildPreviewLocked(session, true)
 		}
 	case "pdf.outdir":
 		if ev.Kind == pluginapi.UIEventChange && ev.Value != "" {
 			u.outputDir = ev.Value
 		}
 	case "pdf.run":
-		if ev.Kind == pluginapi.UIEventClick && !u.running {
-			u.startJobLocked(ctx, session)
+		if !u.running {
+			switch ev.Kind {
+			case pluginapi.UIEventChange:
+				if ev.Value != "" {
+					u.startJobLocked(ctx, session, ev.Value, true)
+				}
+			case pluginapi.UIEventClick:
+				u.startJobLocked(ctx, session, "", false)
+			}
+		}
+	case "pdf.cancel":
+		if ev.Kind == pluginapi.UIEventClick && u.running && u.jobCancel != nil {
+			u.jobCancel()
+			u.progressMsg = u.t("pdf.canceled", "Canceling...")
+		}
+	case "pdf.dismiss_banner":
+		if ev.Kind == pluginapi.UIEventClick {
+			u.inlineError = ""
+			u.resultMsg = ""
+			u.resultOutputs = nil
+			u.resultAuthorized = false
+		}
+	case "pdf.root":
+		if ev.Kind == pluginapi.UIEventShortcut {
+			shouldRender = u.handleShortcutLocked(ev.Value, session)
+		} else {
+			shouldRender = false
 		}
 	default:
-		u.handleListActionLocked(ev)
+		shouldRender = u.handleDynamicEventLocked(ev, session)
 	}
-	tree := u.buildTreeLocked(0)
+
+	if !shouldRender {
+		u.mu.Unlock()
+		return nil
+	}
+	tree := u.buildTreeLocked()
 	u.mu.Unlock()
 
 	if session != nil {
@@ -189,12 +420,62 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 	return nil
 }
 
-func (u *LiveUI) handleListActionLocked(ev pluginapi.UIEvent) {
-	if ev.Kind != pluginapi.UIEventClick {
-		return
+func (u *LiveUI) handleShortcutLocked(val string, session *pluginapi.UISession) bool {
+	switch val {
+	case "ArrowLeft":
+		if u.currentPage > 1 {
+			u.jumpToPageLocked(u.currentPage-1, session)
+			return true
+		}
+	case "ArrowRight":
+		if u.currentPage < len(u.previewPages) {
+			u.jumpToPageLocked(u.currentPage+1, session)
+			return true
+		}
+	case "=":
+		u.setZoomLocked(u.effectiveZoomLocked()*1.2, session)
+		return true
+	case "-":
+		u.setZoomLocked(u.effectiveZoomLocked()/1.2, session)
+		return true
+	case "0":
+		u.fitZoomLocked(session)
+		return true
+	case "Escape":
+		if u.inlineError != "" || u.resultMsg != "" {
+			u.inlineError = ""
+			u.resultMsg = ""
+			return true
+		}
 	}
+	return false
+}
+
+func (u *LiveUI) handleDynamicEventLocked(ev pluginapi.UIEvent, session *pluginapi.UISession) bool {
+	if ev.Kind != pluginapi.UIEventClick {
+		return false
+	}
+	if strings.HasPrefix(ev.Node, "rail_page_") {
+		if p, err := strconv.Atoi(strings.TrimPrefix(ev.Node, "rail_page_")); err == nil {
+			u.jumpToPageLocked(p, session)
+			return true
+		}
+		return false
+	}
+	if strings.HasPrefix(ev.Node, "page_") {
+		if p, err := strconv.Atoi(strings.TrimPrefix(ev.Node, "page_")); err == nil {
+			u.currentPage = p
+			if u.activeTab == "split" && u.splitMode == "range" && len(u.previewPages) > 0 {
+				u.splitPageRange = togglePageInRange(u.splitPageRange, p, len(u.previewPages))
+			}
+			return true
+		}
+		return false
+	}
+
 	var list *[]liveFileItem
 	var prefix string
+	isImageList := false
 	switch {
 	case strings.HasPrefix(ev.Node, "pdf.merge.item."):
 		list = &u.mergeFiles
@@ -202,34 +483,52 @@ func (u *LiveUI) handleListActionLocked(ev pluginapi.UIEvent) {
 	case strings.HasPrefix(ev.Node, "pdf.images.item."):
 		list = &u.imageFiles
 		prefix = "pdf.images.item."
+		isImageList = true
 	case strings.HasPrefix(ev.Node, "pdf.office.item."):
 		list = &u.officeFiles
 		prefix = "pdf.office.item."
 	default:
-		return
+		return false
 	}
+
 	rest := strings.TrimPrefix(ev.Node, prefix)
 	parts := strings.SplitN(rest, ".", 2)
 	if len(parts) != 2 {
-		return
+		return false
 	}
 	idx, err := strconv.Atoi(parts[0])
 	if err != nil || idx < 0 || idx >= len(*list) {
-		return
+		return false
 	}
 	s := *list
 	switch parts[1] {
+	case "jump":
+		u.jumpToSourceIndexLocked(idx, session)
+		return true
 	case "up":
 		if idx > 0 {
 			s[idx-1], s[idx] = s[idx], s[idx-1]
+			u.rebuildPreviewLocked(session, false)
+			return true
 		}
 	case "down":
 		if idx+1 < len(s) {
 			s[idx+1], s[idx] = s[idx], s[idx+1]
+			u.rebuildPreviewLocked(session, false)
+			return true
 		}
 	case "rm":
+		if isImageList && session != nil && session.AssetsDir() != "" && s[idx].AssetFile != "" {
+			_ = os.Remove(filepath.Join(session.AssetsDir(), s[idx].AssetFile))
+		}
 		*list = append(s[:idx], s[idx+1:]...)
+		if u.activeTab == "office" {
+			u.officePreviewFiles = nil
+		}
+		u.rebuildPreviewLocked(session, false)
+		return true
 	}
+	return false
 }
 
 func (u *LiveUI) makeItemLocked(ctx context.Context, path string, session *pluginapi.UISession, copyImageAsset bool) liveFileItem {
@@ -244,46 +543,492 @@ func (u *LiveUI) makeItemLocked(ctx context.Context, path string, session *plugi
 		SizeStr:   sizeStr,
 		PageCount: -1,
 	}
-	if strings.EqualFold(filepath.Ext(path), ".pdf") {
-		if cnt, err := GetPageCount(ctx, path); err == nil {
+	if strings.EqualFold(filepath.Ext(path), ".pdf") && u.renderer != nil {
+		if cnt, err := u.renderer.PageCount(ctx, path); err == nil && cnt > 0 {
 			item.PageCount = cnt
+			item.PageSizes = make([]pageSize, cnt)
+			for p := 1; p <= cnt; p++ {
+				w, h, err := u.renderer.PageDimensions(ctx, path, p)
+				if err != nil || w <= 0 || h <= 0 {
+					w, h = defaultPageW, defaultPageH
+				}
+				item.PageSizes[p-1] = pageSize{W: w, H: h}
+			}
 		}
 	}
-	if copyImageAsset && session != nil && session.AssetsDir() != "" {
-		if data, err := os.ReadFile(path); err == nil && len(data) <= 8<<20 {
-			name := fmt.Sprintf("img_%d%s", len(u.imageFiles), strings.ToLower(filepath.Ext(path)))
-			dst := filepath.Join(session.AssetsDir(), name)
-			if os.WriteFile(dst, data, 0600) == nil {
-				item.AssetRef = "asset:" + name
+	if copyImageAsset {
+		if f, err := os.Open(path); err == nil {
+			if cfg, _, err := image.DecodeConfig(f); err == nil && cfg.Width > 0 && cfg.Height > 0 {
+				item.ImgW = float64(cfg.Width)
+				item.ImgH = float64(cfg.Height)
+			}
+			_ = f.Close()
+		}
+		if session != nil && session.AssetsDir() != "" {
+			if data, err := os.ReadFile(path); err == nil && len(data) <= 8<<20 {
+				u.assetSeq++
+				name := fmt.Sprintf("img_%d%s", u.assetSeq, strings.ToLower(filepath.Ext(path)))
+				dst := filepath.Join(session.AssetsDir(), name)
+				if os.WriteFile(dst, data, 0600) == nil {
+					item.AssetRef = "asset:" + name
+					item.AssetFile = name
+				}
 			}
 		}
 	}
 	return item
 }
 
-func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISession) {
-	var pdfJob PDFJob
+func (u *LiveUI) rebuildPreviewLocked(session *pluginapi.UISession, resetScroll bool) {
+	u.docGen++
+	u.clearPageAssetsLocked(session)
+	u.previewPages = nil
+
+	var pages []previewPage
+	addPDFFiles := func(items []liveFileItem) {
+		for sIdx, it := range items {
+			if it.PageCount <= 0 {
+				continue
+			}
+			for p := 1; p <= it.PageCount; p++ {
+				dim := pageSize{W: defaultPageW, H: defaultPageH}
+				if p-1 < len(it.PageSizes) {
+					dim = it.PageSizes[p-1]
+				}
+				pages = append(pages, previewPage{
+					Kind:       "pdf",
+					SourcePath: it.Path,
+					SourceName: it.Name,
+					SourceIdx:  sIdx,
+					PDFPage:    p,
+					GlobalPage: len(pages) + 1,
+					W:          dim.W,
+					H:          dim.H,
+				})
+			}
+		}
+	}
+
+	switch u.activeTab {
+	case "merge":
+		addPDFFiles(u.mergeFiles)
+	case "split":
+		if u.splitFile != nil {
+			addPDFFiles([]liveFileItem{*u.splitFile})
+		}
+	case "images":
+		for idx, it := range u.imageFiles {
+			w, h := defaultPageW, defaultPageH
+			if it.ImgW > 0 && it.ImgH > 0 {
+				w = defaultPageW
+				h = defaultPageW * (it.ImgH / it.ImgW)
+				if h < 180 {
+					h = 180
+				}
+				if h > 1100 {
+					h = 1100
+				}
+			}
+			pages = append(pages, previewPage{
+				Kind:       "image",
+				SourcePath: it.Path,
+				SourceName: it.Name,
+				SourceIdx:  idx,
+				PDFPage:    1,
+				GlobalPage: len(pages) + 1,
+				W:          w,
+				H:          h,
+				ImageAsset: it.AssetRef,
+			})
+		}
+	case "office":
+		if len(u.officePreviewFiles) > 0 {
+			addPDFFiles(u.officePreviewFiles)
+		}
+	}
+
+	u.previewPages = pages
+	if len(pages) == 0 {
+		u.currentPage = 1
+		u.scrollY = 0
+		u.targetScrollY = 0
+		return
+	}
+	if resetScroll || u.currentPage < 1 || u.currentPage > len(pages) {
+		u.currentPage = 1
+		u.scrollY = 0
+		u.targetScrollY = 0
+		u.scrollSeq++
+	}
+	if resetScroll {
+		u.computeFitZoomLocked()
+		u.zoom = u.fitZoom
+	}
+	u.triggerVisiblePageRendersLocked(session)
+}
+
+func (u *LiveUI) computeFitZoomLocked() {
+	if len(u.previewPages) == 0 {
+		u.fitZoom = 1.0
+		return
+	}
+	first := u.previewPages[0]
+	railW := float64(u.railWidth)
+	if u.railCollapsed {
+		railW = 48
+	}
+	vpW := u.viewportW
+	if vpW <= 0 {
+		vpW = 900
+	}
+	availW := vpW - 64
+	if !u.viewportFromScroll {
+		availW -= railW
+	}
+	if availW < 320 {
+		availW = 500
+	}
+	z := availW / first.W
+	if z < 0.45 {
+		z = 0.45
+	} else if z > 1.6 {
+		z = 1.6
+	}
+	u.fitZoom = z
+}
+
+func (u *LiveUI) fitZoomLocked(session *pluginapi.UISession) {
+	u.computeFitZoomLocked()
+	u.setZoomLocked(u.fitZoom, session)
+}
+
+func (u *LiveUI) setZoomLocked(z float64, session *pluginapi.UISession) {
+	if z < minZoomFactor {
+		z = minZoomFactor
+	} else if z > maxZoomFactor {
+		z = maxZoomFactor
+	}
+	if math.Abs(z-u.zoom) < 0.002 {
+		return
+	}
+	u.zoom = z
+	if len(u.previewPages) == 0 {
+		return
+	}
+	if u.zoomDebounce != nil {
+		u.zoomDebounce.Stop()
+	}
+	docGen := u.docGen
+	u.zoomDebounce = time.AfterFunc(100*time.Millisecond, func() {
+		u.mu.Lock()
+		if u.docGen != docGen || len(u.previewPages) == 0 {
+			u.mu.Unlock()
+			return
+		}
+		u.triggerVisiblePageRendersLocked(session)
+		u.mu.Unlock()
+	})
+}
+
+func (u *LiveUI) effectiveZoomLocked() float64 {
+	if u.zoom <= 0 {
+		return 1.0
+	}
+	return u.zoom
+}
+
+func (u *LiveUI) pageTopYLocked(globalPage int) float64 {
+	const pageGap = 24.0
+	const topPad = 24.0
+	y := topPad
+	z := u.effectiveZoomLocked()
+	for i := 1; i < globalPage && i <= len(u.previewPages); i++ {
+		y += u.previewPages[i-1].H*z + pageGap
+	}
+	return y
+}
+
+func (u *LiveUI) jumpToPageLocked(globalPage int, session *pluginapi.UISession) {
+	if len(u.previewPages) == 0 {
+		return
+	}
+	if globalPage < 1 {
+		globalPage = 1
+	} else if globalPage > len(u.previewPages) {
+		globalPage = len(u.previewPages)
+	}
+	u.currentPage = globalPage
+	targetY := u.pageTopYLocked(globalPage) - 24
+	if targetY < 0 {
+		targetY = 0
+	}
+	u.scrollSeq++
+	u.targetScrollY = targetY
+	u.triggerVisiblePageRendersLocked(session)
+}
+
+func (u *LiveUI) jumpToSourceIndexLocked(sourceIdx int, session *pluginapi.UISession) {
+	for _, pg := range u.previewPages {
+		if pg.SourceIdx == sourceIdx {
+			u.jumpToPageLocked(pg.GlobalPage, session)
+			return
+		}
+	}
+}
+
+func (u *LiveUI) handleViewportScrollLocked(val string, session *pluginapi.UISession) bool {
+	parts := strings.Split(val, ",")
+	if len(parts) < 4 {
+		return false
+	}
+	sy, e2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	cw, e3 := strconv.ParseFloat(strings.TrimSpace(parts[2]), 64)
+	ch, e4 := strconv.ParseFloat(strings.TrimSpace(parts[3]), 64)
+	if e2 != nil {
+		return false
+	}
+	if e3 == nil && cw > 0 {
+		u.viewportW = cw
+		u.viewportFromScroll = true
+	}
+	if e4 == nil && ch > 0 {
+		u.viewportH = ch
+	}
+	u.scrollY = sy
+
+	if len(u.previewPages) <= 1 {
+		return false
+	}
+	focusY := sy + 200
+	if focusY < 0 {
+		focusY = 0
+	}
+	const pageGap = 24.0
+	const topPad = 24.0
+	z := u.effectiveZoomLocked()
+	currY := topPad
+	found := 1
+	for i := 1; i <= len(u.previewPages); i++ {
+		ph := u.previewPages[i-1].H * z
+		if focusY >= currY && focusY <= currY+ph+pageGap {
+			found = i
+			break
+		}
+		if focusY > currY+ph {
+			found = i
+		}
+		currY += ph + pageGap
+	}
+	if found != u.currentPage {
+		u.currentPage = found
+		u.triggerVisiblePageRendersLocked(session)
+		return true
+	}
+	return false
+}
+
+func (u *LiveUI) handleViewportZoomLocked(val string, session *pluginapi.UISession) bool {
+	f, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+	if err != nil || f == 0 {
+		return false
+	}
+	nextZoom := u.effectiveZoomLocked() * (1 + f*0.02)
+	u.setZoomLocked(nextZoom, session)
+	return true
+}
+
+func (u *LiveUI) triggerVisiblePageRendersLocked(session *pluginapi.UISession) {
+	if len(u.previewPages) == 0 {
+		return
+	}
+	scale := pdfeng.QuantizeRenderScale(u.effectiveZoomLocked())
+	start := u.currentPage - 2
+	if start < 1 {
+		start = 1
+	}
+	end := u.currentPage + 2
+	if end > len(u.previewPages) {
+		end = len(u.previewPages)
+	}
+	for p := start; p <= end; p++ {
+		pg := u.previewPages[p-1]
+		if pg.Kind == "pdf" {
+			u.requestPageRenderLocked(pg.SourcePath, pg.PDFPage, scale, session)
+		}
+	}
+}
+
+func (u *LiveUI) requestPageRenderLocked(pdfPath string, pdfPage int, scale float64, session *pluginapi.UISession) {
+	if u.renderer == nil || pdfPath == "" || pdfPage < 1 {
+		return
+	}
+	scale1000 := int(math.Round(scale * 1000))
+	key := pageAssetKey{
+		sourcePath: pdfPath,
+		docGen:     u.docGen,
+		pageNum:    pdfPage,
+		scale1000:  scale1000,
+	}
+	if _, ok := u.pageAssets[key]; ok {
+		return
+	}
+	if u.inFlightRenders[key] {
+		return
+	}
+	if cachedImg, ok := u.pageCache.Get(pdfPath, pdfPage, scale); ok {
+		u.storeRenderedPageAssetLocked(key, cachedImg, session)
+		return
+	}
+
+	u.inFlightRenders[key] = true
+	docGen := u.docGen
+	renderer := u.renderer
+	sem := u.renderSem
+	go func() {
+		sem <- struct{}{}
+		defer func() { <-sem }()
+
+		img, err := renderer.RenderPage(context.Background(), pdfPath, pdfPage, scale)
+		u.mu.Lock()
+		delete(u.inFlightRenders, key)
+		if err != nil || img == nil || u.docGen != docGen {
+			u.mu.Unlock()
+			return
+		}
+		u.pageCache.Put(pdfPath, pdfPage, scale, img)
+		u.storeRenderedPageAssetLocked(key, img, session)
+		tree := u.buildTreeLocked()
+		u.mu.Unlock()
+
+		if session != nil {
+			_ = session.Render(tree)
+		}
+	}()
+}
+
+func (u *LiveUI) storeRenderedPageAssetLocked(key pageAssetKey, img image.Image, session *pluginapi.UISession) {
+	if session == nil || session.AssetsDir() == "" || img == nil {
+		return
+	}
+	u.assetSeq++
+	fileName := fmt.Sprintf("page-%d-g%d-s%d-v%d.png", key.pageNum, key.docGen, key.scale1000, u.assetSeq)
+	if err := writeAssetPNG(session.AssetsDir(), fileName, img); err != nil {
+		return
+	}
+	ref := "asset:" + fileName
+	u.pageAssets[key] = ref
+	u.pageAssetFiles[ref] = fileName
+}
+
+func (u *LiveUI) pageAssetRefLocked(pg previewPage) string {
+	if pg.Kind == "image" {
+		return pg.ImageAsset
+	}
+	scale := pdfeng.QuantizeRenderScale(u.effectiveZoomLocked())
+	exactKey := pageAssetKey{
+		sourcePath: pg.SourcePath,
+		docGen:     u.docGen,
+		pageNum:    pg.PDFPage,
+		scale1000:  int(math.Round(scale * 1000)),
+	}
+	if ref, ok := u.pageAssets[exactKey]; ok {
+		return ref
+	}
+	bestDist := math.MaxFloat64
+	bestRef := ""
+	target := int(math.Round(scale * 1000))
+	for k, ref := range u.pageAssets {
+		if k.docGen != u.docGen || k.sourcePath != pg.SourcePath || k.pageNum != pg.PDFPage {
+			continue
+		}
+		d := math.Abs(float64(k.scale1000 - target))
+		if d < bestDist {
+			bestDist = d
+			bestRef = ref
+		}
+	}
+	return bestRef
+}
+
+func (u *LiveUI) clearPageAssetsLocked(session *pluginapi.UISession) {
+	if session != nil && session.AssetsDir() != "" {
+		dir := session.AssetsDir()
+		for _, fn := range u.pageAssetFiles {
+			_ = os.Remove(filepath.Join(dir, fn))
+		}
+	}
+	u.pageAssets = make(map[pageAssetKey]string)
+	u.pageAssetFiles = make(map[string]string)
+}
+
+func (u *LiveUI) clearImageAssetsLocked(session *pluginapi.UISession) {
+	if session != nil && session.AssetsDir() != "" {
+		dir := session.AssetsDir()
+		for _, it := range u.imageFiles {
+			if it.AssetFile != "" {
+				_ = os.Remove(filepath.Join(dir, it.AssetFile))
+			}
+		}
+	}
+}
+
+func (u *LiveUI) defaultOutputPathLocked() string {
+	switch u.activeTab {
+	case "merge":
+		return filepath.Join(u.outputDir, normalizePDFName(u.mergeOutputName, "merged.pdf"))
+	case "split":
+		return filepath.Join(u.outputDir, normalizePDFName(u.splitOutputName, "extracted.pdf"))
+	case "images":
+		return filepath.Join(u.outputDir, normalizePDFName(u.imageOutputName, "images.pdf"))
+	default:
+		return u.outputDir
+	}
+}
+
+func (u *LiveUI) canRunLocked() bool {
+	if u.running {
+		return false
+	}
+	switch u.activeTab {
+	case "merge":
+		return len(u.mergeFiles) >= 2
+	case "split":
+		if u.splitFile == nil || u.splitFile.Path == "" {
+			return false
+		}
+		if u.splitMode == "range" {
+			return len(parsePageRanges(u.splitPageRange)) > 0
+		}
+		return true
+	case "images":
+		return len(u.imageFiles) >= 1
+	case "office":
+		return len(u.officeFiles) >= 1
+	default:
+		return false
+	}
+}
+
+func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISession, explicitOutFile string, authorized bool) {
+	var pdfJob pdfeng.PDFJob
 	switch u.activeTab {
 	case "merge":
 		if len(u.mergeFiles) < 2 {
 			u.inlineError = "Select at least two PDF files to merge."
 			return
 		}
-		outName := strings.TrimSpace(u.mergeOutputName)
-		if outName == "" {
-			outName = "merged.pdf"
-		}
-		if !strings.HasSuffix(strings.ToLower(outName), ".pdf") {
-			outName += ".pdf"
+		outFile := explicitOutFile
+		if outFile == "" {
+			outFile = filepath.Join(u.outputDir, normalizePDFName(u.mergeOutputName, "merged.pdf"))
 		}
 		inFiles := make([]string, len(u.mergeFiles))
 		for i, f := range u.mergeFiles {
 			inFiles[i] = f.Path
 		}
-		pdfJob = PDFJob{
-			Op:         OpMerge,
+		pdfJob = pdfeng.PDFJob{
+			Op:         pdfeng.OpMerge,
 			InputFiles: inFiles,
-			OutputFile: filepath.Join(u.outputDir, outName),
+			OutputFile: outFile,
 		}
 	case "split":
 		if u.splitFile == nil || u.splitFile.Path == "" {
@@ -296,25 +1041,26 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 				u.inlineError = "Enter a valid page selection (e.g. 1-3, 5)."
 				return
 			}
-			outName := strings.TrimSpace(u.splitOutputName)
-			if outName == "" {
-				outName = "extracted.pdf"
+			outFile := explicitOutFile
+			if outFile == "" {
+				outFile = filepath.Join(u.outputDir, normalizePDFName(u.splitOutputName, "extracted.pdf"))
 			}
-			if !strings.HasSuffix(strings.ToLower(outName), ".pdf") {
-				outName += ".pdf"
-			}
-			pdfJob = PDFJob{
-				Op:         OpExtract,
+			pdfJob = pdfeng.PDFJob{
+				Op:         pdfeng.OpExtract,
 				InputFiles: []string{u.splitFile.Path},
-				OutputFile: filepath.Join(u.outputDir, outName),
+				OutputFile: outFile,
 				PageRanges: ranges,
 			}
 		} else {
-			pdfJob = PDFJob{
-				Op:         OpSplit,
+			span := 1
+			if n, err := strconv.Atoi(strings.TrimSpace(u.splitSpan)); err == nil && n > 0 {
+				span = n
+			}
+			pdfJob = pdfeng.PDFJob{
+				Op:         pdfeng.OpSplit,
 				InputFiles: []string{u.splitFile.Path},
 				OutputDir:  u.outputDir,
-				PageSpan:   1,
+				PageSpan:   span,
 			}
 		}
 	case "images":
@@ -322,21 +1068,18 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 			u.inlineError = "Select at least one image."
 			return
 		}
-		outName := strings.TrimSpace(u.imageOutputName)
-		if outName == "" {
-			outName = "images.pdf"
-		}
-		if !strings.HasSuffix(strings.ToLower(outName), ".pdf") {
-			outName += ".pdf"
+		outFile := explicitOutFile
+		if outFile == "" {
+			outFile = filepath.Join(u.outputDir, normalizePDFName(u.imageOutputName, "images.pdf"))
 		}
 		inFiles := make([]string, len(u.imageFiles))
 		for i, f := range u.imageFiles {
 			inFiles[i] = f.Path
 		}
-		pdfJob = PDFJob{
-			Op:         OpImages,
+		pdfJob = pdfeng.PDFJob{
+			Op:         pdfeng.OpImages,
 			InputFiles: inFiles,
-			OutputFile: filepath.Join(u.outputDir, outName),
+			OutputFile: outFile,
 		}
 	case "office":
 		if len(u.officeFiles) == 0 {
@@ -347,8 +1090,8 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 		for i, f := range u.officeFiles {
 			inFiles[i] = f.Path
 		}
-		pdfJob = PDFJob{
-			Op:          OpOffice,
+		pdfJob = pdfeng.PDFJob{
+			Op:          pdfeng.OpOffice,
 			InputFiles:  inFiles,
 			OutputDir:   u.outputDir,
 			SofficePath: u.sofficePath,
@@ -357,282 +1100,82 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 		return
 	}
 
+	jobCtx, cancel := context.WithCancel(ctx)
+	u.jobGen++
+	curGen := u.jobGen
+	u.jobCancel = cancel
 	u.running = true
 	u.inlineError = ""
 	u.resultMsg = ""
+	u.resultOutputs = nil
+	u.resultAuthorized = authorized
 	u.progress = 5
 	u.progressMsg = "Starting…"
 
 	go func() {
-		res, err := pdfJob.Run(ctx, func(pr job.Progress) {
+		defer cancel()
+		res, err := pdfJob.Run(jobCtx, func(pr job.Progress) {
 			u.mu.Lock()
+			if u.jobGen != curGen {
+				u.mu.Unlock()
+				return
+			}
 			u.progress = pr.Done
 			u.progressMsg = pr.Message
-			tree := u.buildTreeLocked(0)
+			tree := u.buildTreeLocked()
 			u.mu.Unlock()
 			if session != nil {
 				_ = session.Render(tree)
 			}
 		})
+
 		u.mu.Lock()
+		if u.jobGen != curGen {
+			u.mu.Unlock()
+			return
+		}
 		u.running = false
+		u.jobCancel = nil
 		if err != nil {
-			u.inlineError = err.Error()
+			if errors.Is(err, context.Canceled) || errors.Is(err, job.ErrCanceled) {
+				u.inlineError = u.t("pdf.canceled", "Operation canceled.")
+			} else {
+				u.inlineError = err.Error()
+			}
 			u.progress = 0
 			u.progressMsg = ""
 		} else {
 			u.progress = 100
+			u.resultOutputs = res.Outputs
 			u.resultMsg = res.Summary
 			if u.resultMsg == "" {
-				u.resultMsg = "Completed."
+				u.resultMsg = u.t("pdf.complete", "Completed.")
+			}
+			if u.history != nil && len(res.Outputs) > 0 {
+				_ = u.history.Add(pdfeng.HistoryItem{
+					ID:          fmt.Sprintf("pdf-%d", time.Now().UnixNano()),
+					Operation:   string(pdfJob.Op),
+					Summary:     u.resultMsg,
+					OutputFile:  res.Outputs[0],
+					FileCount:   len(pdfJob.InputFiles),
+					CompletedAt: time.Now(),
+				})
+			}
+			if pdfJob.Op == pdfeng.OpOffice && len(res.Outputs) > 0 {
+				var converted []liveFileItem
+				for _, outPDF := range res.Outputs {
+					converted = append(converted, u.makeItemLocked(context.Background(), outPDF, session, false))
+				}
+				u.officePreviewFiles = converted
+				u.rebuildPreviewLocked(session, true)
 			}
 		}
-		tree := u.buildTreeLocked(0)
+		tree := u.buildTreeLocked()
 		u.mu.Unlock()
 		if session != nil {
 			_ = session.Render(tree)
 		}
 	}()
-}
-
-func (u *LiveUI) buildTreeLocked(rev uint64) pluginapi.UITree {
-	var body []pluginapi.UINode
-	switch u.activeTab {
-	case "merge":
-		body = u.buildMergeBodyLocked()
-	case "split":
-		body = u.buildSplitBodyLocked()
-	case "images":
-		body = u.buildImagesBodyLocked()
-	case "office":
-		body = u.buildOfficeBodyLocked()
-	}
-
-	if u.inlineError != "" {
-		body = append(body, liveNode("pdf.err", pluginapi.UINodeText, pluginapi.UITextProps{
-			Text:    u.inlineError,
-			Variant: "danger",
-		}))
-	}
-	if u.running {
-		body = append(body, liveNode("pdf.progress", pluginapi.UINodeProgress, pluginapi.UIProgressProps{
-			Done:  u.progress,
-			Total: 100,
-			Label: u.progressMsg,
-		}))
-	}
-	if u.resultMsg != "" {
-		body = append(body, liveNode("pdf.result", pluginapi.UINodeColumn, pluginapi.UIContainerProps{
-			Padding: 12,
-			Surface: "field_support",
-			Border:  true,
-		}, liveNode("pdf.result.txt", pluginapi.UINodeText, pluginapi.UITextProps{
-			Text:    u.resultMsg,
-			Variant: "body",
-		})))
-	}
-
-	root := liveNode("pdf.root", pluginapi.UINodeScroll, pluginapi.UIContainerProps{
-		Padding: 20,
-		Gap:     16,
-		Surface: "ground",
-		Grow:    true,
-	},
-		liveNode("pdf.header", pluginapi.UINodeRow, pluginapi.UIContainerProps{
-			Gap: 10,
-		},
-			liveNode("pdf.header.icon", pluginapi.UINodeIcon, pluginapi.UIIconProps{
-				Name: "file-text",
-				Size: 22,
-				Tone: "accent",
-			}),
-			liveNode("pdf.header.title", pluginapi.UINodeText, pluginapi.UITextProps{
-				Text:    u.t("title", "PDF Utility"),
-				Variant: "title",
-			}),
-		),
-		liveNode("pdf.tabs", pluginapi.UINodeTabs, pluginapi.UITabsProps{
-			Active: u.activeTab,
-			Tabs: []pluginapi.SurfaceOption{
-				{Value: "merge", Label: u.t("tab_merge", "Merge")},
-				{Value: "split", Label: u.t("tab_split", "Split")},
-				{Value: "images", Label: u.t("tab_images", "Images to PDF")},
-				{Value: "office", Label: u.t("tab_office", "Office to PDF")},
-			},
-		}),
-		liveNode("pdf.card", pluginapi.UINodeColumn, pluginapi.UIContainerProps{
-			Padding: 16,
-			Gap:     12,
-			Surface: "paper",
-			Border:  true,
-		}, body...),
-	)
-	return pluginapi.UITree{Rev: rev, Root: root}
-}
-
-func (u *LiveUI) buildMergeBodyLocked() []pluginapi.UINode {
-	nodes := []pluginapi.UINode{
-		liveNode("pdf.merge.title", pluginapi.UINodeText, pluginapi.UITextProps{Text: "Merge PDF Files", Variant: "title"}),
-		liveNode("pdf.merge.pick", pluginapi.UINodeFilePicker, pluginapi.UIFilePickerProps{
-			Label:      "Add PDF Files",
-			Mode:       "open",
-			Extensions: []string{"pdf"},
-			Multiple:   true,
-			Disabled:   u.running,
-		}),
-	}
-	nodes = append(nodes, u.buildFileListLocked("pdf.merge.item", u.mergeFiles, true)...)
-	nodes = append(nodes,
-		liveNode("pdf.merge.outlbl", pluginapi.UINodeText, pluginapi.UITextProps{Text: "Output PDF Name", Variant: "muted"}),
-		liveNode("pdf.merge.outname", pluginapi.UINodeTextInput, pluginapi.UITextInputProps{Value: u.mergeOutputName, Placeholder: "merged.pdf", Disabled: u.running}),
-		liveNode("pdf.outdir", pluginapi.UINodeDirPicker, pluginapi.UIDirPickerProps{Label: "Save Destination", Value: u.outputDir, Disabled: u.running}),
-		liveNode("pdf.run", pluginapi.UINodeButton, pluginapi.UIButtonProps{Label: "Merge PDFs", Variant: "primary", Icon: "file-text", Disabled: u.running}),
-	)
-	return nodes
-}
-
-func (u *LiveUI) buildSplitBodyLocked() []pluginapi.UINode {
-	picked := ""
-	info := "No PDF document selected."
-	if u.splitFile != nil {
-		picked = u.splitFile.Path
-		if u.splitFile.PageCount > 0 {
-			info = fmt.Sprintf("%s (%d pages)", u.splitFile.Name, u.splitFile.PageCount)
-		} else {
-			info = u.splitFile.Name
-		}
-	}
-	nodes := []pluginapi.UINode{
-		liveNode("pdf.split.title", pluginapi.UINodeText, pluginapi.UITextProps{Text: "Split PDF File", Variant: "title"}),
-		liveNode("pdf.split.pick", pluginapi.UINodeFilePicker, pluginapi.UIFilePickerProps{
-			Label:      "Select PDF File",
-			Value:      picked,
-			Mode:       "open",
-			Extensions: []string{"pdf"},
-			Disabled:   u.running,
-		}),
-		liveNode("pdf.split.info", pluginapi.UINodeText, pluginapi.UITextProps{Text: info, Variant: "muted"}),
-		liveNode("pdf.split.mode", pluginapi.UINodeSelect, pluginapi.UISelectProps{
-			Label:    "Split Method",
-			Value:    u.splitMode,
-			Disabled: u.running,
-			Options: []pluginapi.SurfaceOption{
-				{Value: "all", Label: "Separate All Pages"},
-				{Value: "range", Label: "Extract Page Range"},
-			},
-		}),
-	}
-	if u.splitMode == "range" {
-		nodes = append(nodes,
-			liveNode("pdf.split.range", pluginapi.UINodeTextInput, pluginapi.UITextInputProps{
-				Value:       u.splitPageRange,
-				Placeholder: "e.g. 1-3, 5, 8-10",
-				Disabled:    u.running,
-			}),
-			liveNode("pdf.split.outname", pluginapi.UINodeTextInput, pluginapi.UITextInputProps{
-				Value:       u.splitOutputName,
-				Placeholder: "extracted.pdf",
-				Disabled:    u.running,
-			}),
-		)
-	}
-	nodes = append(nodes,
-		liveNode("pdf.outdir", pluginapi.UINodeDirPicker, pluginapi.UIDirPickerProps{Label: "Save Destination", Value: u.outputDir, Disabled: u.running}),
-		liveNode("pdf.run", pluginapi.UINodeButton, pluginapi.UIButtonProps{Label: "Split PDF", Variant: "primary", Icon: "scissors", Disabled: u.running}),
-	)
-	return nodes
-}
-
-func (u *LiveUI) buildImagesBodyLocked() []pluginapi.UINode {
-	nodes := []pluginapi.UINode{
-		liveNode("pdf.images.title", pluginapi.UINodeText, pluginapi.UITextProps{Text: "Convert Images to PDF", Variant: "title"}),
-		liveNode("pdf.images.pick", pluginapi.UINodeFilePicker, pluginapi.UIFilePickerProps{
-			Label:      "Add Images",
-			Mode:       "open",
-			Extensions: []string{"png", "jpg", "jpeg", "webp", "bmp"},
-			Multiple:   true,
-			Disabled:   u.running,
-		}),
-	}
-	nodes = append(nodes, u.buildFileListLocked("pdf.images.item", u.imageFiles, true)...)
-	nodes = append(nodes,
-		liveNode("pdf.images.outname", pluginapi.UINodeTextInput, pluginapi.UITextInputProps{Value: u.imageOutputName, Placeholder: "images.pdf", Disabled: u.running}),
-		liveNode("pdf.outdir", pluginapi.UINodeDirPicker, pluginapi.UIDirPickerProps{Label: "Save Destination", Value: u.outputDir, Disabled: u.running}),
-		liveNode("pdf.run", pluginapi.UINodeButton, pluginapi.UIButtonProps{Label: "Convert to PDF", Variant: "primary", Icon: "image", Disabled: u.running}),
-	)
-	return nodes
-}
-
-func (u *LiveUI) buildOfficeBodyLocked() []pluginapi.UINode {
-	sofficeStatus := "LibreOffice detected."
-	if _, err := FindSofficePath(u.sofficePath); err != nil {
-		sofficeStatus = "LibreOffice (soffice) not found. Configure its path in Settings."
-	}
-	nodes := []pluginapi.UINode{
-		liveNode("pdf.office.title", pluginapi.UINodeText, pluginapi.UITextProps{Text: "Convert Office Documents to PDF", Variant: "title"}),
-		liveNode("pdf.office.status", pluginapi.UINodeText, pluginapi.UITextProps{Text: sofficeStatus, Variant: "muted"}),
-		liveNode("pdf.office.pick", pluginapi.UINodeFilePicker, pluginapi.UIFilePickerProps{
-			Label:      "Add Documents",
-			Mode:       "open",
-			Extensions: []string{"doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf"},
-			Multiple:   true,
-			Disabled:   u.running,
-		}),
-	}
-	nodes = append(nodes, u.buildFileListLocked("pdf.office.item", u.officeFiles, false)...)
-	nodes = append(nodes,
-		liveNode("pdf.outdir", pluginapi.UINodeDirPicker, pluginapi.UIDirPickerProps{Label: "Save Destination", Value: u.outputDir, Disabled: u.running}),
-		liveNode("pdf.run", pluginapi.UINodeButton, pluginapi.UIButtonProps{Label: "Convert Documents", Variant: "primary", Icon: "office", Disabled: u.running}),
-	)
-	return nodes
-}
-
-func (u *LiveUI) buildFileListLocked(prefix string, items []liveFileItem, reorderable bool) []pluginapi.UINode {
-	if len(items) == 0 {
-		return []pluginapi.UINode{
-			liveNode(prefix+".empty", pluginapi.UINodeEmpty, pluginapi.UIEmptyProps{
-				Title:    "No files added",
-				Subtitle: "Use the file picker above to add files.",
-			}),
-		}
-	}
-	out := make([]pluginapi.UINode, 0, len(items))
-	for i, it := range items {
-		id := fmt.Sprintf("%s.%d", prefix, i)
-		meta := it.SizeStr
-		if it.PageCount > 0 {
-			meta = fmt.Sprintf("%s · %d pages", it.SizeStr, it.PageCount)
-		}
-		var rowChildren []pluginapi.UINode
-		if it.AssetRef != "" {
-			rowChildren = append(rowChildren, liveNode(id+".thumb", pluginapi.UINodeImage, pluginapi.UIImageProps{
-				Src: it.AssetRef, Fit: "contain", Width: 36, Height: 36,
-			}))
-		} else {
-			rowChildren = append(rowChildren, liveNode(id+".ic", pluginapi.UINodeIcon, pluginapi.UIIconProps{
-				Name: "file-text", Size: 18, Tone: "muted",
-			}))
-		}
-		rowChildren = append(rowChildren,
-			liveNode(id+".info", pluginapi.UINodeColumn, pluginapi.UIContainerProps{Gap: 2, Grow: true},
-				liveNode(id+".name", pluginapi.UINodeText, pluginapi.UITextProps{Text: it.Name, Variant: "body"}),
-				liveNode(id+".meta", pluginapi.UINodeText, pluginapi.UITextProps{Text: meta, Variant: "muted"}),
-			),
-		)
-		if reorderable {
-			rowChildren = append(rowChildren,
-				liveNode(id+".up", pluginapi.UINodeButton, pluginapi.UIButtonProps{Label: "↑", Variant: "secondary", Disabled: u.running || i == 0}),
-				liveNode(id+".down", pluginapi.UINodeButton, pluginapi.UIButtonProps{Label: "↓", Variant: "secondary", Disabled: u.running || i == len(items)-1}),
-			)
-		}
-		rowChildren = append(rowChildren,
-			liveNode(id+".rm", pluginapi.UINodeButton, pluginapi.UIButtonProps{Label: "Remove", Variant: "danger", Icon: "trash", Disabled: u.running}),
-		)
-		out = append(out, liveNode(id, pluginapi.UINodeRow, pluginapi.UIContainerProps{
-			Padding: 8, Gap: 8, Surface: "ground", Border: true,
-		}, rowChildren...))
-	}
-	return out
 }
 
 func liveNode(id, kind string, props any, children ...pluginapi.UINode) pluginapi.UINode {
@@ -648,6 +1191,34 @@ func liveNode(id, kind string, props any, children ...pluginapi.UINode) pluginap
 		Props:    rawMap,
 		Children: children,
 	}
+}
+
+func writeAssetPNG(assetsDir, fileName string, img image.Image) error {
+	if assetsDir == "" || img == nil {
+		return fmt.Errorf("missing assets dir")
+	}
+	dst := filepath.Join(assetsDir, fileName)
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if err := png.Encode(f, img); err != nil {
+		_ = f.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return f.Close()
+}
+
+func normalizePDFName(raw, fallback string) string {
+	outName := strings.TrimSpace(raw)
+	if outName == "" {
+		outName = fallback
+	}
+	if !strings.HasSuffix(strings.ToLower(outName), ".pdf") {
+		outName += ".pdf"
+	}
+	return outName
 }
 
 func splitPickedPaths(raw string) []string {
@@ -668,6 +1239,72 @@ func parsePageRanges(raw string) []string {
 		}
 	}
 	return out
+}
+
+func parseIncludedPages(raw string, maxPage int) map[int]bool {
+	included := make(map[int]bool)
+	if maxPage <= 0 {
+		return included
+	}
+	for _, part := range parsePageRanges(raw) {
+		if strings.Contains(part, "-") {
+			bounds := strings.SplitN(part, "-", 2)
+			start, e1 := strconv.Atoi(strings.TrimSpace(bounds[0]))
+			end, e2 := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if e1 == nil && e2 == nil {
+				if start > end {
+					start, end = end, start
+				}
+				for p := start; p <= end; p++ {
+					if p >= 1 && p <= maxPage {
+						included[p] = true
+					}
+				}
+			}
+			continue
+		}
+		if p, err := strconv.Atoi(part); err == nil && p >= 1 && p <= maxPage {
+			included[p] = true
+		}
+	}
+	return included
+}
+
+func togglePageInRange(raw string, page int, maxPage int) string {
+	included := parseIncludedPages(raw, maxPage)
+	if included[page] {
+		delete(included, page)
+	} else if page >= 1 && page <= maxPage {
+		included[page] = true
+	}
+	if len(included) == 0 {
+		return ""
+	}
+	pages := make([]int, 0, len(included))
+	for p := range included {
+		pages = append(pages, p)
+	}
+	sort.Ints(pages)
+
+	var parts []string
+	start, prev := pages[0], pages[0]
+	for i := 1; i < len(pages); i++ {
+		if pages[i] == prev+1 {
+			prev = pages[i]
+			continue
+		}
+		parts = append(parts, formatPageRun(start, prev))
+		start, prev = pages[i], pages[i]
+	}
+	parts = append(parts, formatPageRun(start, prev))
+	return strings.Join(parts, ", ")
+}
+
+func formatPageRun(start, end int) string {
+	if start == end {
+		return strconv.Itoa(start)
+	}
+	return fmt.Sprintf("%d-%d", start, end)
 }
 
 func expandHome(p string) string {

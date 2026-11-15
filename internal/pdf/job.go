@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/seiortech/mtools-sdk/pluginapi"
+	"github.com/seiortech/mtools-sdk/job"
 )
 
 // OpType represents the PDF processing mode.
@@ -32,92 +32,92 @@ type PDFJob struct {
 }
 
 // Run executes the PDF operation as a background job.
-func (j PDFJob) Run(ctx context.Context, progress func(pluginapi.Progress)) (pluginapi.RunResult, error) {
+func (j PDFJob) Run(ctx context.Context, progress func(job.Progress)) (job.Result, error) {
 	if progress == nil {
-		progress = func(pluginapi.Progress) {}
+		progress = func(job.Progress) {}
 	}
 
-	progress(pluginapi.Progress{Done: 10, Total: 100, Unit: "%", Message: "Starting " + string(j.Op) + "..."})
+	progress(job.Progress{Done: 10, Total: 100, Unit: "%", Message: "Starting " + string(j.Op) + "..."})
 
 	select {
 	case <-ctx.Done():
-		return pluginapi.RunResult{}, context.Canceled
+		return job.Result{}, job.ErrCanceled
 	default:
 	}
 
 	switch j.Op {
 	case OpMerge:
 		if len(j.InputFiles) == 0 {
-			return pluginapi.RunResult{}, ErrEmptyInput
+			return job.Result{}, ErrEmptyInput
 		}
-		progress(pluginapi.Progress{Done: 30, Total: 100, Unit: "%", Message: fmt.Sprintf("Merging %d files...", len(j.InputFiles))})
+		progress(job.Progress{Done: 30, Total: 100, Unit: "%", Message: fmt.Sprintf("Merging %d files...", len(j.InputFiles))})
 		if err := MergePDFs(ctx, j.InputFiles, j.OutputFile); err != nil {
-			return pluginapi.RunResult{}, err
+			return job.Result{}, err
 		}
-		progress(pluginapi.Progress{Done: 100, Total: 100, Unit: "%", Message: "Merge completed"})
-		return pluginapi.RunResult{
+		progress(job.Progress{Done: 100, Total: 100, Unit: "%", Message: "Merge completed"})
+		return job.Result{
 			Outputs: []string{j.OutputFile},
 			Summary: fmt.Sprintf("Successfully merged %d files into %s", len(j.InputFiles), filepath.Base(j.OutputFile)),
 		}, nil
 
 	case OpSplit:
 		if len(j.InputFiles) == 0 || j.InputFiles[0] == "" {
-			return pluginapi.RunResult{}, ErrEmptyInput
+			return job.Result{}, ErrEmptyInput
 		}
-		progress(pluginapi.Progress{Done: 30, Total: 100, Unit: "%", Message: "Splitting PDF into pages..."})
+		progress(job.Progress{Done: 30, Total: 100, Unit: "%", Message: "Splitting PDF into pages..."})
 		outFiles, err := SplitPDF(ctx, j.InputFiles[0], j.OutputDir, j.PageSpan)
 		if err != nil {
-			return pluginapi.RunResult{}, err
+			return job.Result{}, err
 		}
-		progress(pluginapi.Progress{Done: 100, Total: 100, Unit: "%", Message: "Split completed"})
-		return pluginapi.RunResult{
+		progress(job.Progress{Done: 100, Total: 100, Unit: "%", Message: "Split completed"})
+		return job.Result{
 			Outputs: outFiles,
 			Summary: fmt.Sprintf("Split %s into %d files", filepath.Base(j.InputFiles[0]), len(outFiles)),
 		}, nil
 
 	case OpExtract:
 		if len(j.InputFiles) == 0 || j.InputFiles[0] == "" {
-			return pluginapi.RunResult{}, ErrEmptyInput
+			return job.Result{}, ErrEmptyInput
 		}
-		progress(pluginapi.Progress{Done: 30, Total: 100, Unit: "%", Message: "Extracting pages..."})
+		progress(job.Progress{Done: 30, Total: 100, Unit: "%", Message: "Extracting pages..."})
 		if err := ExtractPages(ctx, j.InputFiles[0], j.OutputFile, j.PageRanges); err != nil {
-			return pluginapi.RunResult{}, err
+			return job.Result{}, err
 		}
-		progress(pluginapi.Progress{Done: 100, Total: 100, Unit: "%", Message: "Extract completed"})
-		return pluginapi.RunResult{
+		progress(job.Progress{Done: 100, Total: 100, Unit: "%", Message: "Extract completed"})
+		return job.Result{
 			Outputs: []string{j.OutputFile},
 			Summary: fmt.Sprintf("Extracted pages (%s) from %s", strings.Join(j.PageRanges, ", "), filepath.Base(j.InputFiles[0])),
 		}, nil
 
 	case OpImages:
 		if len(j.InputFiles) == 0 {
-			return pluginapi.RunResult{}, ErrEmptyInput
+			return job.Result{}, ErrEmptyInput
 		}
-		progress(pluginapi.Progress{Done: 30, Total: 100, Unit: "%", Message: fmt.Sprintf("Converting %d images to PDF...", len(j.InputFiles))})
+		progress(job.Progress{Done: 30, Total: 100, Unit: "%", Message: fmt.Sprintf("Converting %d images to PDF...", len(j.InputFiles))})
 		if err := ImagesToPDF(ctx, j.InputFiles, j.OutputFile); err != nil {
-			return pluginapi.RunResult{}, err
+			return job.Result{}, err
 		}
-		progress(pluginapi.Progress{Done: 100, Total: 100, Unit: "%", Message: "Conversion completed"})
-		return pluginapi.RunResult{
+		progress(job.Progress{Done: 100, Total: 100, Unit: "%", Message: "Conversion completed"})
+		return job.Result{
 			Outputs: []string{j.OutputFile},
 			Summary: fmt.Sprintf("Converted %d images to %s", len(j.InputFiles), filepath.Base(j.OutputFile)),
 		}, nil
 
 	case OpOffice:
 		if len(j.InputFiles) == 0 {
-			return pluginapi.RunResult{}, ErrEmptyInput
+			return job.Result{}, ErrEmptyInput
 		}
 		var outputs []string
 		total := len(j.InputFiles)
 		for i, f := range j.InputFiles {
 			select {
 			case <-ctx.Done():
-				return pluginapi.RunResult{}, context.Canceled
+				return job.Result{}, job.ErrCanceled
 			default:
 			}
 
 			pct := 20.0 + (float64(i)/float64(total))*70.0
-			progress(pluginapi.Progress{
+			progress(job.Progress{
 				Done:    pct,
 				Total:   100,
 				Unit:    "%",
@@ -126,18 +126,18 @@ func (j PDFJob) Run(ctx context.Context, progress func(pluginapi.Progress)) (plu
 
 			outPDF, err := ConvertOfficeToPDF(ctx, j.SofficePath, f, j.OutputDir)
 			if err != nil {
-				return pluginapi.RunResult{Outputs: outputs}, err
+				return job.Result{Outputs: outputs}, err
 			}
 			outputs = append(outputs, outPDF)
 		}
 
-		progress(pluginapi.Progress{Done: 100, Total: 100, Unit: "%", Message: "Office conversion completed"})
-		return pluginapi.RunResult{
+		progress(job.Progress{Done: 100, Total: 100, Unit: "%", Message: "Office conversion completed"})
+		return job.Result{
 			Outputs: outputs,
 			Summary: fmt.Sprintf("Converted %d document(s) to PDF", len(outputs)),
 		}, nil
 
 	default:
-		return pluginapi.RunResult{}, fmt.Errorf("unknown operation type: %s", j.Op)
+		return job.Result{}, fmt.Errorf("unknown operation type: %s", j.Op)
 	}
 }
