@@ -9,8 +9,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/seiortech/mtools-sdk/pluginapi"
 	"github.com/seiortech/mtools-plugin-pdf/internal/pdf"
+	pdfui "github.com/seiortech/mtools-plugin-pdf/pdf"
+	"github.com/seiortech/mtools-sdk/pluginapi"
 )
 
 type pdfServer struct{}
@@ -277,7 +278,8 @@ func main() {
 		Version:  "1.0.0",
 	}
 	server := &pdfServer{}
-	if err := pluginapi.Serve(context.Background(), os.Stdin, os.Stdout, identity, server); err != nil {
+	live := pdfui.NewLiveUI()
+	if err := pluginapi.ServeLive(context.Background(), os.Stdin, os.Stdout, identity, server, live); err != nil {
 		os.Exit(1)
 	}
 }

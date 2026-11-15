@@ -3,6 +3,10 @@
   "tools": [
     {
       "id": "pdf",
+      "live": {
+        "initial_title": "PDF Utility",
+        "mode": "tree"
+      },
       "modes": [
         {
           "id": "merge",
