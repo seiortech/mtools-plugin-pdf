@@ -1,6 +1,7 @@
 package pdf
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -356,8 +357,9 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		}, canvasChildren...))
 	}
 
-	return liveNode("pdf.viewport", pluginapi.UINodeScroll, pluginapi.UIContainerProps{
+	viewportNode := liveNode("pdf.viewport", pluginapi.UINodeScroll, pluginapi.UIContainerProps{
 		Fill:        true,
+		Grow:        true,
 		Padding:     24,
 		Gap:         24,
 		Align:       "center",
@@ -371,6 +373,47 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 			Smooth: u.scrollSeq > 1,
 		},
 	}, pageNodes...)
+
+	if u.previewEngineErr == nil {
+		return viewportNode
+	}
+
+	titleKey := "pdf.pdfium_missing_title"
+	fallbackTitle := "PDFium preview engine not configured"
+	if errors.Is(u.previewEngineErr, pdfeng.ErrPDFiumInvalid) {
+		titleKey = "pdf.pdfium_invalid_title"
+		fallbackTitle = "PDFium preview engine failed to load"
+	}
+	banner := liveNode("pdfium_engine_banner", pluginapi.UINodeRow, pluginapi.UIContainerProps{
+		Surface: "sunken",
+		Padding: 12,
+		Gap:     12,
+		Align:   "center",
+	},
+		liveNode("pdfium_engine_msg_col", pluginapi.UINodeColumn, pluginapi.UIContainerProps{
+			Grow: true,
+			Gap:  2,
+		},
+			liveNode("pdfium_engine_title", pluginapi.UINodeText, pluginapi.UITextProps{
+				Text:    u.t(titleKey, fallbackTitle),
+				Variant: "warning",
+			}),
+			liveNode("pdfium_engine_desc", pluginapi.UINodeText, pluginapi.UITextProps{
+				Text:    u.t("pdf.pdfium_missing_desc", "Open App Settings -> PDFium WebAssembly (pdfium.wasm), click Download pdfium.wasm or select pdfium.wasm, then click Reload Preview."),
+				Variant: "muted",
+			}),
+		),
+		liveNode("retry_pdfium", pluginapi.UINodeButton, pluginapi.UIButtonProps{
+			Label:   u.t("pdf.btn_reload_preview", "Reload Preview"),
+			Variant: "secondary",
+			Icon:    "refresh-cw",
+		}),
+	)
+
+	return liveNode("pdf.viewport_with_banner", pluginapi.UINodeColumn, pluginapi.UIContainerProps{
+		Fill: true,
+		Grow: true,
+	}, banner, viewportNode)
 }
 
 func (u *LiveUI) buildEmptyPreviewLocked() pluginapi.UINode {

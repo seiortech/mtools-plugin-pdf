@@ -3,5 +3,5 @@
 package pdf
 
 func defaultPlatformRenderer() PageRenderer {
-	return &FallbackRenderer{}
+	return NewPDFiumRenderer()
 }

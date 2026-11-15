@@ -61,6 +61,7 @@ func (r *FallbackRenderer) RenderPage(ctx context.Context, pdfPath string, pageN
 			pdfPath,
 			"-",
 		)
+		setCmdHideWindow(cmd)
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		if err := cmd.Run(); err == nil {

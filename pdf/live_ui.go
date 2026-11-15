@@ -76,13 +76,16 @@ type liveFileItem struct {
 // LiveUI implements pluginapi.LiveUI for PDF Utility as a full-bleed
 // Sage Garden workbench with native PDF & image page previews.
 type LiveUI struct {
-	mu       sync.Mutex
-	rev      uint64
-	catalog  *i18n.Catalog
-	lang     i18n.Lang
-	dataDir  string
-	history  *pdfeng.HistoryStore
-	renderer pdfeng.PageRenderer
+	mu               sync.Mutex
+	rev              uint64
+	catalog          *i18n.Catalog
+	lang             i18n.Lang
+	dataDir          string
+	appSettingsFile  string
+	sharedPDFiumDir  string
+	history          *pdfeng.HistoryStore
+	renderer         pdfeng.PageRenderer
+	previewEngineErr error
 
 	activeTab string // "merge", "split", "images", "office"
 
@@ -213,19 +216,87 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 		u.sofficePath = sp
 	}
 	if u.dataDir == "" {
-		if dd := os.Getenv("MTOOLS_PLUGIN_DATA"); dd != "" {
+		if dd := params.Settings["plugin_data_dir"]; dd != "" {
+			u.dataDir = dd
+			u.history = pdfeng.NewHistoryStore(dd)
+		} else if dd := os.Getenv("MTOOLS_PLUGIN_DATA"); dd != "" {
 			u.dataDir = dd
 			u.history = pdfeng.NewHistoryStore(dd)
 		}
 	}
+	u.appSettingsFile = params.Settings["app_settings_file"]
+	u.sharedPDFiumDir = params.Settings["shared_pdfium_dir"]
+	u.configureRendererLocked(params.Settings)
 
 	return u.buildTreeLocked(), nil
+}
+
+func (u *LiveUI) configureRendererLocked(settings map[string]string) {
+	cr, ok := u.renderer.(pdfeng.ConfigurableRenderer)
+	if !ok {
+		return
+	}
+	wasmPath := ""
+	if settings != nil {
+		wasmPath = strings.TrimSpace(settings["pdfium_wasm_path"])
+	}
+	if wasmPath == "" && u.appSettingsFile != "" {
+		if raw, err := os.ReadFile(u.appSettingsFile); err == nil {
+			var parsed map[string]any
+			if json.Unmarshal(raw, &parsed) == nil {
+				if v, ok := parsed["pdfium_wasm_path"].(string); ok {
+					wasmPath = strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+	if wasmPath == "" && u.sharedPDFiumDir != "" {
+		candidate := filepath.Join(u.sharedPDFiumDir, "pdfium.wasm")
+		if _, err := os.Stat(candidate); err == nil {
+			wasmPath = candidate
+		}
+	}
+	cacheDir := ""
+	if u.dataDir != "" {
+		cacheDir = filepath.Join(u.dataDir, "pdfium-cache")
+	}
+	cr.Configure(pdfeng.RendererConfig{
+		WASMPath: wasmPath,
+		CacheDir: cacheDir,
+	})
+}
+
+func (u *LiveUI) Close(ctx context.Context) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.zoomDebounce != nil {
+		u.zoomDebounce.Stop()
+		u.zoomDebounce = nil
+	}
+	if u.jobCancel != nil {
+		u.jobCancel()
+		u.jobCancel = nil
+	}
+	if cr, ok := u.renderer.(pdfeng.ConfigurableRenderer); ok {
+		return cr.Close()
+	}
+	return nil
 }
 
 func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginapi.UISession) error {
 	u.mu.Lock()
 	shouldRender := true
 	switch ev.Node {
+	case "retry_pdfium":
+		if ev.Kind == pluginapi.UIEventClick {
+			u.previewEngineErr = nil
+			u.configureRendererLocked(nil)
+			u.pageCache.Clear()
+			u.pageAssets = make(map[pageAssetKey]string)
+			u.triggerVisiblePageRendersLocked(session)
+		} else {
+			shouldRender = false
+		}
 	case "pdf.tabs":
 		if ev.Kind == pluginapi.UIEventSelect && ev.Value != "" && ev.Value != u.activeTab {
 			u.activeTab = ev.Value
@@ -891,10 +962,24 @@ func (u *LiveUI) requestPageRenderLocked(pdfPath string, pdfPage int, scale floa
 		img, err := renderer.RenderPage(context.Background(), pdfPath, pdfPage, scale)
 		u.mu.Lock()
 		delete(u.inFlightRenders, key)
-		if err != nil || img == nil || u.docGen != docGen {
+		if err != nil {
+			if (errors.Is(err, pdfeng.ErrPDFiumMissing) || errors.Is(err, pdfeng.ErrPDFiumInvalid)) && u.docGen == docGen {
+				u.previewEngineErr = err
+				tree := u.buildTreeLocked()
+				u.mu.Unlock()
+				if session != nil {
+					_ = session.Render(tree)
+				}
+				return
+			}
 			u.mu.Unlock()
 			return
 		}
+		if img == nil || u.docGen != docGen {
+			u.mu.Unlock()
+			return
+		}
+		u.previewEngineErr = nil
 		u.pageCache.Put(pdfPath, pdfPage, scale, img)
 		u.storeRenderedPageAssetLocked(key, img, session)
 		tree := u.buildTreeLocked()
