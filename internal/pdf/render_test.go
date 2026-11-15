@@ -75,6 +75,7 @@ func TestFallbackAndDefaultRenderer(t *testing.T) {
 	}
 
 	dr := DefaultRenderer()
+	configureTestRenderer(t, dr)
 	img, err := dr.RenderPage(context.Background(), pdfPath, 1, 1.0)
 	if err != nil || img.Bounds().Dx() <= 0 || img.Bounds().Dy() <= 0 {
 		t.Fatalf("DefaultRenderer.RenderPage = (%v, %v)", img, err)

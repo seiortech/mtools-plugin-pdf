@@ -304,3 +304,26 @@ func TestLiveUIImmediateSaveOnClick(t *testing.T) {
 	}
 	_ = tree
 }
+
+func TestLiveUIEngineMissingBannerValidates(t *testing.T) {
+	dir := t.TempDir()
+	pdfDoc := createSamplePDF(t, dir, "doc", 2)
+
+	ui := NewLiveUI()
+	_, _ = ui.Open(context.Background(), pluginapi.UIOpenParams{
+		Tool:     "pdf",
+		Viewport: pluginapi.UIViewport{Width: 1180, Height: 760},
+		Settings: map[string]string{"output_dir": dir},
+	}, nil)
+	_ = ui.Event(context.Background(), pluginapi.UIEvent{Rev: 1, Node: "pdf.tabs", Kind: pluginapi.UIEventSelect, Value: "split"}, nil)
+	_ = ui.Event(context.Background(), pluginapi.UIEvent{Rev: 2, Node: "pdf.split.pick", Kind: pluginapi.UIEventChange, Value: pdfDoc}, nil)
+
+	ui.mu.Lock()
+	ui.previewEngineErr = pdfeng.ErrPDFiumMissing
+	tree := ui.buildTreeLocked()
+	ui.mu.Unlock()
+
+	if err := tree.Validate(); err != nil {
+		t.Fatalf("engine missing banner tree invalid: %v", err)
+	}
+}

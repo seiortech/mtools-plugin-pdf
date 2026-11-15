@@ -385,10 +385,12 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		fallbackTitle = "PDFium preview engine failed to load"
 	}
 	banner := liveNode("pdfium_engine_banner", pluginapi.UINodeRow, pluginapi.UIContainerProps{
-		Surface: "sunken",
-		Padding: 12,
-		Gap:     12,
-		Align:   "center",
+		Surface:     "paper",
+		BorderSize:  1,
+		BorderToken: "danger",
+		Padding:     12,
+		Gap:         12,
+		Align:       "center",
 	},
 		liveNode("pdfium_engine_msg_col", pluginapi.UINodeColumn, pluginapi.UIContainerProps{
 			Grow: true,
@@ -396,7 +398,7 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		},
 			liveNode("pdfium_engine_title", pluginapi.UINodeText, pluginapi.UITextProps{
 				Text:    u.t(titleKey, fallbackTitle),
-				Variant: "warning",
+				Variant: "danger",
 			}),
 			liveNode("pdfium_engine_desc", pluginapi.UINodeText, pluginapi.UITextProps{
 				Text:    u.t("pdf.pdfium_missing_desc", "Open App Settings -> PDFium WebAssembly (pdfium.wasm), click Download pdfium.wasm or select pdfium.wasm, then click Reload Preview."),
