@@ -2,8 +2,10 @@ package pdf
 
 import (
 	"context"
+	"errors"
 	"image"
 	"image/color"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -70,8 +72,13 @@ func TestFallbackAndDefaultRenderer(t *testing.T) {
 	if err != nil || w <= 0 || h <= 0 {
 		t.Fatalf("FallbackRenderer.PageDimensions = (%v, %v, %v)", w, h, err)
 	}
-	if _, err := fb.RenderPage(context.Background(), pdfPath, 1, 1.0); err != nil {
-		t.Fatalf("FallbackRenderer.RenderPage: %v", err)
+	_, fbErr := fb.RenderPage(context.Background(), pdfPath, 1, 1.0)
+	if _, lookErr := exec.LookPath("pdftoppm"); lookErr == nil {
+		if fbErr != nil {
+			t.Fatalf("FallbackRenderer.RenderPage with pdftoppm: %v", fbErr)
+		}
+	} else if !errors.Is(fbErr, ErrNoPreviewEngine) {
+		t.Fatalf("FallbackRenderer.RenderPage = %v, want ErrNoPreviewEngine", fbErr)
 	}
 
 	dr := DefaultRenderer()

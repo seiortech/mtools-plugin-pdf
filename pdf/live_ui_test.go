@@ -326,4 +326,22 @@ func TestLiveUIEngineMissingBannerValidates(t *testing.T) {
 	if err := tree.Validate(); err != nil {
 		t.Fatalf("engine missing banner tree invalid: %v", err)
 	}
+	if _, ok := findNode(tree.Root, "download_pdfium"); !ok {
+		t.Fatalf("expected download_pdfium button in engine banner")
+	}
+	if _, ok := findNode(tree.Root, "open_settings"); !ok {
+		t.Fatalf("expected open_settings button in engine banner")
+	}
+}
+
+func findNode(n pluginapi.UINode, id string) (pluginapi.UINode, bool) {
+	if n.ID == id {
+		return n, true
+	}
+	for _, ch := range n.Children {
+		if found, ok := findNode(ch, id); ok {
+			return found, true
+		}
+	}
+	return pluginapi.UINode{}, false
 }

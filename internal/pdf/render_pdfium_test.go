@@ -133,4 +133,36 @@ func TestPDFiumRendererRealWASMSmoke(t *testing.T) {
 	if c.R > 30 || c.G > 30 || c.B > 30 {
 		t.Fatalf("expected dark rendered pixel at center, got %+v", c)
 	}
+
+	cnt, err := r.PageCount(context.Background(), pdfPath)
+	if err != nil || cnt != 1 {
+		t.Fatalf("PageCount = (%d, %v), want (1, nil)", cnt, err)
+	}
+	wPt, hPt, err := r.PageDimensions(context.Background(), pdfPath, 1)
+	if err != nil || wPt != 200 || hPt != 200 {
+		t.Fatalf("PageDimensions = (%v, %v, %v), want (200, 200, nil)", wPt, hPt, err)
+	}
+}
+
+func TestPDFiumRendererCheckEngine(t *testing.T) {
+	r := NewPDFiumRenderer()
+	if err := r.CheckEngine(); err != nil {
+		// On machines without pdftoppm, missing WASM returns ErrPDFiumMissing.
+		if err != ErrPDFiumMissing {
+			t.Fatalf("CheckEngine unconfigured = %v, want ErrPDFiumMissing", err)
+		}
+	}
+
+	badPath := filepath.Join(t.TempDir(), "bad.wasm")
+	if err := os.WriteFile(badPath, []byte("not-wasm"), 0o644); err != nil {
+		t.Fatalf("write bad wasm: %v", err)
+	}
+	r.Configure(RendererConfig{WASMPath: badPath})
+	if err := r.CheckEngine(); err == nil {
+		// Note: CheckEngine checks size/stat; invalid magic is caught by ensurePool.
+		_, poolErr := r.ensurePool()
+		if poolErr == nil {
+			t.Fatalf("expected ensurePool error for invalid wasm")
+		}
+	}
 }

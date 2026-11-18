@@ -5,8 +5,6 @@ import (
 	"context"
 	"fmt"
 	"image"
-	"image/color"
-	"image/draw"
 	"image/png"
 	"math"
 	"os"
@@ -71,31 +69,10 @@ func (r *FallbackRenderer) RenderPage(ctx context.Context, pdfPath string, pageN
 		}
 	}
 
-	wPt, hPt, err := r.PageDimensions(ctx, pdfPath, pageNum)
-	if err != nil {
+	if _, _, err := r.PageDimensions(ctx, pdfPath, pageNum); err != nil {
 		return nil, err
 	}
-
-	w := int(math.Ceil(wPt * scale))
-	h := int(math.Ceil(hPt * scale))
-	if w <= 0 || h <= 0 {
-		w, h = int(595*scale), int(842*scale)
-	}
-
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
-
-	borderColor := color.RGBA{R: 220, G: 220, B: 220, A: 255}
-	for x := 0; x < w; x++ {
-		img.Set(x, 0, borderColor)
-		img.Set(x, h-1, borderColor)
-	}
-	for y := 0; y < h; y++ {
-		img.Set(0, y, borderColor)
-		img.Set(w-1, y, borderColor)
-	}
-
-	return img, nil
+	return nil, ErrNoPreviewEngine
 }
 
 var _ PageRenderer = (*FallbackRenderer)(nil)

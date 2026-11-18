@@ -1,6 +1,7 @@
 package pdf
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -77,6 +78,7 @@ type liveFileItem struct {
 // Sage Garden workbench with native PDF & image page previews.
 type LiveUI struct {
 	mu               sync.Mutex
+	renderMu         sync.Mutex
 	rev              uint64
 	catalog          *i18n.Catalog
 	lang             i18n.Lang
@@ -128,9 +130,10 @@ type LiveUI struct {
 	pageCache       *pdfeng.PageBitmapCache
 	pageAssets      map[pageAssetKey]string
 	pageAssetFiles  map[string]string
-	renderSem       chan struct{}
-	inFlightRenders map[pageAssetKey]bool
-	zoomDebounce    *time.Timer
+	renderSem        chan struct{}
+	inFlightRenders  map[pageAssetKey]bool
+	previewRenderErr map[pageAssetKey]string
+	zoomDebounce     *time.Timer
 	assetSeq        int
 
 	// Output & job state
@@ -166,8 +169,9 @@ func NewLiveUI() *LiveUI {
 		pageCache:       pdfeng.NewPageBitmapCache(48),
 		pageAssets:      make(map[pageAssetKey]string),
 		pageAssetFiles:  make(map[string]string),
-		renderSem:       make(chan struct{}, 2),
-		inFlightRenders: make(map[pageAssetKey]bool),
+		renderSem:        make(chan struct{}, 2),
+		inFlightRenders:  make(map[pageAssetKey]bool),
+		previewRenderErr: make(map[pageAssetKey]string),
 	}
 }
 
@@ -227,6 +231,9 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 	u.appSettingsFile = params.Settings["app_settings_file"]
 	u.sharedPDFiumDir = params.Settings["shared_pdfium_dir"]
 	u.configureRendererLocked(params.Settings)
+	if ec, ok := u.renderer.(interface{ CheckEngine() error }); ok {
+		u.previewEngineErr = ec.CheckEngine()
+	}
 
 	return u.buildTreeLocked(), nil
 }
@@ -290,9 +297,14 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 	case "retry_pdfium":
 		if ev.Kind == pluginapi.UIEventClick {
 			u.previewEngineErr = nil
+			u.previewRenderErr = make(map[pageAssetKey]string)
+			u.inFlightRenders = make(map[pageAssetKey]bool)
 			u.configureRendererLocked(nil)
+			if ec, ok := u.renderer.(interface{ CheckEngine() error }); ok {
+				u.previewEngineErr = ec.CheckEngine()
+			}
 			u.pageCache.Clear()
-			u.pageAssets = make(map[pageAssetKey]string)
+			u.clearPageAssetsLocked(session)
 			u.triggerVisiblePageRendersLocked(session)
 		} else {
 			shouldRender = false
@@ -482,13 +494,23 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 		u.mu.Unlock()
 		return nil
 	}
+	u.mu.Unlock()
+
+	return u.renderAndSend(session)
+}
+
+func (u *LiveUI) renderAndSend(session *pluginapi.UISession) error {
+	if session == nil {
+		return nil
+	}
+	u.renderMu.Lock()
+	defer u.renderMu.Unlock()
+
+	u.mu.Lock()
 	tree := u.buildTreeLocked()
 	u.mu.Unlock()
 
-	if session != nil {
-		return session.Render(tree)
-	}
-	return nil
+	return session.Render(tree)
 }
 
 func (u *LiveUI) handleShortcutLocked(val string, session *pluginapi.UISession) bool {
@@ -960,34 +982,51 @@ func (u *LiveUI) requestPageRenderLocked(pdfPath string, pdfPage int, scale floa
 		defer func() { <-sem }()
 
 		img, err := renderer.RenderPage(context.Background(), pdfPath, pdfPage, scale)
-		u.mu.Lock()
-		delete(u.inFlightRenders, key)
 		if err != nil {
-			if (errors.Is(err, pdfeng.ErrPDFiumMissing) || errors.Is(err, pdfeng.ErrPDFiumInvalid)) && u.docGen == docGen {
-				u.previewEngineErr = err
-				tree := u.buildTreeLocked()
+			u.mu.Lock()
+			delete(u.inFlightRenders, key)
+			if u.docGen != docGen {
 				u.mu.Unlock()
-				if session != nil {
-					_ = session.Render(tree)
-				}
 				return
 			}
+			if errors.Is(err, pdfeng.ErrPDFiumMissing) || errors.Is(err, pdfeng.ErrPDFiumInvalid) || errors.Is(err, pdfeng.ErrNoPreviewEngine) {
+				u.previewEngineErr = err
+			} else {
+				u.previewRenderErr[key] = err.Error()
+			}
+			u.mu.Unlock()
+			_ = u.renderAndSend(session)
+			return
+		}
+		if img == nil {
+			u.mu.Lock()
+			delete(u.inFlightRenders, key)
 			u.mu.Unlock()
 			return
 		}
-		if img == nil || u.docGen != docGen {
+
+		var pngBytes []byte
+		if session != nil && session.AssetsDir() != "" {
+			pngBytes, _ = encodeAssetPNG(img)
+		}
+
+		u.mu.Lock()
+		delete(u.inFlightRenders, key)
+		if u.docGen != docGen {
 			u.mu.Unlock()
 			return
 		}
 		u.previewEngineErr = nil
+		delete(u.previewRenderErr, key)
 		u.pageCache.Put(pdfPath, pdfPage, scale, img)
-		u.storeRenderedPageAssetLocked(key, img, session)
-		tree := u.buildTreeLocked()
+		if len(pngBytes) > 0 {
+			u.storeRenderedPageAssetBytesLocked(key, pngBytes, session)
+		} else {
+			u.storeRenderedPageAssetLocked(key, img, session)
+		}
 		u.mu.Unlock()
 
-		if session != nil {
-			_ = session.Render(tree)
-		}
+		_ = u.renderAndSend(session)
 	}()
 }
 
@@ -995,9 +1034,20 @@ func (u *LiveUI) storeRenderedPageAssetLocked(key pageAssetKey, img image.Image,
 	if session == nil || session.AssetsDir() == "" || img == nil {
 		return
 	}
+	b, err := encodeAssetPNG(img)
+	if err != nil {
+		return
+	}
+	u.storeRenderedPageAssetBytesLocked(key, b, session)
+}
+
+func (u *LiveUI) storeRenderedPageAssetBytesLocked(key pageAssetKey, pngBytes []byte, session *pluginapi.UISession) {
+	if session == nil || session.AssetsDir() == "" || len(pngBytes) == 0 {
+		return
+	}
 	u.assetSeq++
 	fileName := fmt.Sprintf("page-%d-g%d-s%d-v%d.png", key.pageNum, key.docGen, key.scale1000, u.assetSeq)
-	if err := writeAssetPNG(session.AssetsDir(), fileName, img); err != nil {
+	if err := writeAssetPNGBytes(session.AssetsDir(), fileName, pngBytes); err != nil {
 		return
 	}
 	ref := "asset:" + fileName
@@ -1044,6 +1094,7 @@ func (u *LiveUI) clearPageAssetsLocked(session *pluginapi.UISession) {
 	}
 	u.pageAssets = make(map[pageAssetKey]string)
 	u.pageAssetFiles = make(map[string]string)
+	u.previewRenderErr = make(map[pageAssetKey]string)
 }
 
 func (u *LiveUI) clearImageAssetsLocked(session *pluginapi.UISession) {
@@ -1207,11 +1258,8 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 			}
 			u.progress = pr.Done
 			u.progressMsg = pr.Message
-			tree := u.buildTreeLocked()
 			u.mu.Unlock()
-			if session != nil {
-				_ = session.Render(tree)
-			}
+			_ = u.renderAndSend(session)
 		})
 
 		u.mu.Lock()
@@ -1255,11 +1303,8 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 				u.rebuildPreviewLocked(session, true)
 			}
 		}
-		tree := u.buildTreeLocked()
 		u.mu.Unlock()
-		if session != nil {
-			_ = session.Render(tree)
-		}
+		_ = u.renderAndSend(session)
 	}()
 }
 
@@ -1278,21 +1323,50 @@ func liveNode(id, kind string, props any, children ...pluginapi.UINode) pluginap
 	}
 }
 
-func writeAssetPNG(assetsDir, fileName string, img image.Image) error {
-	if assetsDir == "" || img == nil {
+func encodeAssetPNG(img image.Image) ([]byte, error) {
+	if img == nil {
+		return nil, fmt.Errorf("missing image")
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func writeAssetPNGBytes(assetsDir, fileName string, data []byte) error {
+	if assetsDir == "" || len(data) == 0 {
 		return fmt.Errorf("missing assets dir")
 	}
 	dst := filepath.Join(assetsDir, fileName)
-	f, err := os.Create(dst)
+	tmp, err := os.CreateTemp(assetsDir, ".tmp-*.png")
 	if err != nil {
 		return err
 	}
-	if err := png.Encode(f, img); err != nil {
-		_ = f.Close()
-		_ = os.Remove(dst)
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	return f.Close()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func writeAssetPNG(assetsDir, fileName string, img image.Image) error {
+	data, err := encodeAssetPNG(img)
+	if err != nil {
+		return err
+	}
+	return writeAssetPNGBytes(assetsDir, fileName, data)
 }
 
 func normalizePDFName(raw, fallback string) string {

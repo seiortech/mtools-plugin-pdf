@@ -239,8 +239,8 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 
 	pageNodes := make([]pluginapi.UINode, 0, len(u.previewPages))
 	for _, pg := range u.previewPages {
-		pw := max(int(math.Round(pg.W*z)), 100)
-		ph := max(int(math.Round(pg.H*z)), 100)
+		pw := min(max(int(math.Round(pg.W*z)), 100), 8192)
+		ph := min(max(int(math.Round(pg.H*z)), 100), 8192)
 
 		if absInt(pg.GlobalPage-u.currentPage) > 4 {
 			pageNodes = append(pageNodes, liveNode(fmt.Sprintf("page_spacer_%d", pg.GlobalPage), pluginapi.UINodeColumn, pluginapi.UIContainerProps{
@@ -263,6 +263,15 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		assetRef := u.pageAssetRefLocked(pg)
 		var canvasChildren []pluginapi.UINode
 		if assetRef == "" {
+			loadingText := u.t("pdf.rendering_page", "Rendering page...")
+			loadingVariant := "muted"
+			for ek, emsg := range u.previewRenderErr {
+				if ek.docGen == u.docGen && ek.sourcePath == pg.SourcePath && ek.pageNum == pg.PDFPage && emsg != "" {
+					loadingText = u.t("pdf.preview_render_failed", "Page preview failed to render")
+					loadingVariant = "danger"
+					break
+				}
+			}
 			canvasChildren = append(canvasChildren, liveNode(fmt.Sprintf("page_loading_%d", pg.GlobalPage), pluginapi.UINodeColumn, pluginapi.UIContainerProps{
 				Width:       pw,
 				Height:      ph,
@@ -271,8 +280,8 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 				NoFillWidth: true,
 			},
 				liveNode(fmt.Sprintf("page_loading_txt_%d", pg.GlobalPage), pluginapi.UINodeText, pluginapi.UITextProps{
-					Text:    u.t("pdf.rendering_page", "Rendering page..."),
-					Variant: "muted",
+					Text:    loadingText,
+					Variant: loadingVariant,
 				}),
 			))
 		}
@@ -405,11 +414,30 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 				Variant: "muted",
 			}),
 		),
-		liveNode("retry_pdfium", pluginapi.UINodeButton, pluginapi.UIButtonProps{
-			Label:   u.t("pdf.btn_reload_preview", "Reload Preview"),
-			Variant: "secondary",
-			Icon:    "refresh-cw",
-		}),
+		liveNode("pdfium_engine_actions", pluginapi.UINodeRow, pluginapi.UIContainerProps{
+			Gap:         8,
+			Align:       "center",
+			NoFillWidth: true,
+		},
+			liveNode("download_pdfium", pluginapi.UINodeButton, pluginapi.UIButtonProps{
+				Label:          u.t("pdf.btn_download_pdfium", "Download pdfium.wasm"),
+				Variant:        "primary",
+				Icon:           "download",
+				HostAction:     "run_app_setting_action",
+				HostSettingKey: "pdfium_wasm_path",
+			}),
+			liveNode("open_settings", pluginapi.UINodeButton, pluginapi.UIButtonProps{
+				Label:      u.t("pdf.btn_open_settings", "Open App Settings"),
+				Variant:    "secondary",
+				Icon:       "settings",
+				HostAction: "open_app_settings",
+			}),
+			liveNode("retry_pdfium", pluginapi.UINodeButton, pluginapi.UIButtonProps{
+				Label:   u.t("pdf.btn_reload_preview", "Reload Preview"),
+				Variant: "secondary",
+				Icon:    "refresh-cw",
+			}),
+		),
 	)
 
 	return liveNode("pdf.viewport_with_banner", pluginapi.UINodeColumn, pluginapi.UIContainerProps{
