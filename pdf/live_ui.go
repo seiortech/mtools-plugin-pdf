@@ -21,9 +21,9 @@ import (
 	"time"
 
 	pdfeng "github.com/seiortech/mtools-plugin-pdf/internal/pdf"
+	"github.com/seiortech/mtools-sdk/i18n"
 	"github.com/seiortech/mtools-sdk/job"
 	"github.com/seiortech/mtools-sdk/pluginapi"
-	"github.com/seiortech/mtools-sdk/ui/i18n"
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/webp"
 )
