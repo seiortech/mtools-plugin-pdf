@@ -22,13 +22,14 @@ const (
 
 // PDFJob configures and executes a PDF processing operation.
 type PDFJob struct {
-	Op          OpType
-	InputFiles  []string
-	OutputFile  string
-	OutputDir   string
-	PageSpan    int
-	PageRanges  []string
-	SofficePath string
+	Op           OpType
+	InputFiles   []string
+	OutputFile   string
+	OutputDir    string
+	PageSpan     int
+	PageRanges   []string
+	SofficePath  string
+	OfficeEngine OfficeEngine
 }
 
 // Run executes the PDF operation as a background job.
@@ -124,7 +125,12 @@ func (j PDFJob) Run(ctx context.Context, progress func(job.Progress)) (job.Resul
 				Message: fmt.Sprintf("Converting [%d/%d] %s...", i+1, total, filepath.Base(f)),
 			})
 
-			outPDF, err := ConvertOfficeToPDF(ctx, j.SofficePath, f, j.OutputDir)
+			outPDF, err := ConvertOfficeToPDFWithSpec(ctx, OfficeConvertSpec{
+				Engine:      j.OfficeEngine,
+				SofficePath: j.SofficePath,
+				InputFile:   f,
+				OutputDir:   j.OutputDir,
+			})
 			if err != nil {
 				return job.Result{Outputs: outputs}, err
 			}

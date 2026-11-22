@@ -42,12 +42,20 @@ func (s *pdfServer) Inspect(ctx context.Context, p pluginapi.InspectParams) (plu
 		}
 	}
 
-	// Helper status for LibreOffice
-	sofficePath, err := resolveSofficePath(p.Settings)
+	// Helper status for Office conversion engines
+	customSoffice := p.Settings["soffice_path"]
+	if customSoffice == "" {
+		customSoffice = p.Settings["helper_soffice"]
+	}
+	officeStatus := pdf.DetectOfficeEngines(customSoffice)
+	msg := "Install LibreOffice (or Microsoft Office on Windows / Apple Pages, Numbers, Keynote on macOS) for office document conversion"
+	if officeStatus.HasAny() {
+		msg = "Detected: " + officeStatus.Summary()
+	}
 	res.HelperStatus["soffice"] = pluginapi.HelperStatus{
-		Found:   err == nil,
-		Path:    sofficePath,
-		Message: "LibreOffice is required for office document conversion",
+		Found:   officeStatus.HasAny(),
+		Path:    officeStatus.LibreOfficePath,
+		Message: msg,
 	}
 
 	return res, nil
@@ -231,6 +239,10 @@ func (s *pdfServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(pl
 			return pluginapi.RunResult{}, errors.New("missing output directory")
 		}
 		sofficePath, _ := resolveSofficePath(p.Settings)
+		officeEngine, err := pdf.ParseOfficeEngine(p.Settings["office_engine"])
+		if err != nil {
+			return pluginapi.RunResult{}, err
+		}
 		var outputs []string
 		total := len(officeFiles)
 		for i, officeFile := range officeFiles {
@@ -244,9 +256,14 @@ func (s *pdfServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(pl
 				Total:   100,
 				Unit:    "%",
 				Message: fmt.Sprintf("Converting [%d/%d] %s...", i+1, total, filepath.Base(officeFile)),
-				LogLine: fmt.Sprintf("Converting %s via LibreOffice", filepath.Base(officeFile)),
+				LogLine: fmt.Sprintf("Converting %s (engine=%s)", filepath.Base(officeFile), officeEngine),
 			})
-			outPDF, err := pdf.ConvertOfficeToPDF(ctx, sofficePath, officeFile, outDir)
+			outPDF, err := pdf.ConvertOfficeToPDFWithSpec(ctx, pdf.OfficeConvertSpec{
+				Engine:      officeEngine,
+				SofficePath: sofficePath,
+				InputFile:   officeFile,
+				OutputDir:   outDir,
+			})
 			if err != nil {
 				return pluginapi.RunResult{Outputs: outputs}, err
 			}

@@ -85,6 +85,9 @@ type LiveUI struct {
 	dataDir          string
 	appSettingsFile  string
 	sharedPDFiumDir  string
+	sharedTools      pluginapi.SharedToolsProvider
+	lastSettings     map[string]string
+	pdfiumCustomPath string
 	history          *pdfeng.HistoryStore
 	renderer         pdfeng.PageRenderer
 	previewEngineErr error
@@ -110,6 +113,7 @@ type LiveUI struct {
 	officeFiles        []liveFileItem
 	officePreviewFiles []liveFileItem
 	sofficePath        string
+	officeEngine       pdfeng.OfficeEngine
 
 	// Preview & viewport state
 	docGen             uint64
@@ -219,6 +223,11 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 	} else if sp := params.Settings["helper_soffice"]; sp != "" {
 		u.sofficePath = sp
 	}
+	if eng, err := pdfeng.ParseOfficeEngine(params.Settings["office_engine"]); err == nil {
+		u.officeEngine = eng
+	} else {
+		u.officeEngine = pdfeng.OfficeEngineAuto
+	}
 	if u.dataDir == "" {
 		if dd := params.Settings["plugin_data_dir"]; dd != "" {
 			u.dataDir = dd
@@ -230,6 +239,16 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 	}
 	u.appSettingsFile = params.Settings["app_settings_file"]
 	u.sharedPDFiumDir = params.Settings["shared_pdfium_dir"]
+	u.pdfiumCustomPath = strings.TrimSpace(params.Settings["pdfium_wasm_path"])
+	u.lastSettings = make(map[string]string, len(params.Settings))
+	for k, v := range params.Settings {
+		u.lastSettings[k] = v
+	}
+	if session != nil {
+		u.sharedTools = session.SharedTools()
+	} else {
+		u.sharedTools = params.SharedTools()
+	}
 	u.configureRendererLocked(params.Settings)
 	if ec, ok := u.renderer.(interface{ CheckEngine() error }); ok {
 		u.previewEngineErr = ec.CheckEngine()
@@ -243,30 +262,45 @@ func (u *LiveUI) configureRendererLocked(settings map[string]string) {
 	if !ok {
 		return
 	}
-	wasmPath := ""
-	if settings != nil {
-		wasmPath = strings.TrimSpace(settings["pdfium_wasm_path"])
+	effective := make(map[string]string, len(u.lastSettings)+len(settings)+1)
+	for k, v := range u.lastSettings {
+		effective[k] = v
 	}
-	if wasmPath == "" && u.appSettingsFile != "" {
+	for k, v := range settings {
+		effective[k] = v
+	}
+	legacyAppWasm := ""
+	if u.appSettingsFile != "" {
 		if raw, err := os.ReadFile(u.appSettingsFile); err == nil {
 			var parsed map[string]any
 			if json.Unmarshal(raw, &parsed) == nil {
-				if v, ok := parsed["pdfium_wasm_path"].(string); ok {
-					wasmPath = strings.TrimSpace(v)
+				if v, ok := parsed[pluginapi.SettingSharedToolsDir].(string); ok && strings.TrimSpace(v) != "" {
+					effective[pluginapi.SettingSharedToolsDir] = strings.TrimSpace(v)
+				}
+				if v, ok := parsed["pdfium_wasm_path"].(string); ok && strings.TrimSpace(v) != "" {
+					legacyAppWasm = strings.TrimSpace(v)
 				}
 			}
 		}
 	}
-	if wasmPath == "" && u.sharedPDFiumDir != "" {
-		candidate := filepath.Join(u.sharedPDFiumDir, "pdfium.wasm")
-		if _, err := os.Stat(candidate); err == nil {
-			wasmPath = candidate
-		}
+	st := pluginapi.NewSharedTools(effective)
+	u.sharedTools = st
+
+	spec := pluginapi.SharedToolSpec{
+		FileName: "pdfium.wasm",
 	}
-	cacheDir := ""
-	if u.dataDir != "" {
-		cacheDir = filepath.Join(u.dataDir, "pdfium-cache")
+	if u.sharedPDFiumDir != "" {
+		spec.LegacyDirs = append(spec.LegacyDirs, u.sharedPDFiumDir)
 	}
+	if legacyAppWasm != "" {
+		spec.LegacyPaths = append(spec.LegacyPaths, legacyAppWasm)
+	}
+	explicit := u.pdfiumCustomPath
+	if settings != nil && strings.TrimSpace(settings["pdfium_wasm_path"]) != "" {
+		explicit = strings.TrimSpace(settings["pdfium_wasm_path"])
+	}
+	wasmPath, _ := st.Resolve(explicit, spec)
+	cacheDir := st.SharedCacheDir("pdfium", u.dataDir)
 	cr.Configure(pdfeng.RendererConfig{
 		WASMPath: wasmPath,
 		CacheDir: cacheDir,
@@ -1227,10 +1261,11 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 			inFiles[i] = f.Path
 		}
 		pdfJob = pdfeng.PDFJob{
-			Op:          pdfeng.OpOffice,
-			InputFiles:  inFiles,
-			OutputDir:   u.outputDir,
-			SofficePath: u.sofficePath,
+			Op:           pdfeng.OpOffice,
+			InputFiles:   inFiles,
+			OutputDir:    u.outputDir,
+			SofficePath:  u.sofficePath,
+			OfficeEngine: u.officeEngine,
 		}
 	default:
 		return

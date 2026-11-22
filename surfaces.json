@@ -142,6 +142,19 @@
           "required": true
         },
         {
+          "id": "office_engine",
+          "kind": "select",
+          "label": "Office conversion engine",
+          "description": "Local engine used for Office to PDF conversion. Auto uses Microsoft Office on Windows, LibreOffice or Apple iWork (Pages/Numbers/Keynote) on macOS, and LibreOffice on Linux.",
+          "default": "auto",
+          "options": [
+            { "label": "Auto (Recommended)", "value": "auto" },
+            { "label": "LibreOffice", "value": "libreoffice" },
+            { "label": "Microsoft Office (Windows)", "value": "msoffice" },
+            { "label": "Apple iWork — Pages / Numbers / Keynote (macOS)", "value": "iwork" }
+          ]
+        },
+        {
           "id": "soffice_path",
           "kind": "file",
           "label": "LibreOffice executable path",
@@ -154,6 +167,14 @@
             "description": "Open official LibreOffice download page in browser.",
             "url": "https://www.libreoffice.org/download/download-libreoffice/"
           }
+        },
+        {
+          "id": "pdfium_wasm_path",
+          "kind": "file",
+          "label": "PDFium WebAssembly override (optional)",
+          "description": "Leave empty to auto-detect pdfium.wasm from your Shared Tools folder (Windows/Linux page preview).",
+          "placeholder": "",
+          "default": ""
         }
       ]
     }

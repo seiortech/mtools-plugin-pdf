@@ -410,7 +410,7 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 				Variant: "danger",
 			}),
 			liveNode("pdfium_engine_desc", pluginapi.UINodeText, pluginapi.UITextProps{
-				Text:    u.t("pdf.pdfium_missing_desc", "Open App Settings -> PDFium WebAssembly (pdfium.wasm), click Download pdfium.wasm or select pdfium.wasm, then click Reload Preview."),
+				Text:    u.t("pdf.pdfium_missing_desc", "Click Download pdfium.wasm to install it into your Shared Tools folder (reused across all PDF plugins), or change the folder in App Settings."),
 				Variant: "muted",
 			}),
 		),
@@ -424,7 +424,7 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 				Variant:        "primary",
 				Icon:           "download",
 				HostAction:     "run_app_setting_action",
-				HostSettingKey: "pdfium_wasm_path",
+				HostSettingKey: "fetch_pdfium",
 			}),
 			liveNode("open_settings", pluginapi.UINodeButton, pluginapi.UIButtonProps{
 				Label:      u.t("pdf.btn_open_settings", "Open App Settings"),
@@ -815,19 +815,20 @@ func (u *LiveUI) buildModeControlsLocked() []pluginapi.UINode {
 		return nodes
 
 	case "office":
-		sofficeStatus := u.t("pdf.libreoffice_ok", "LibreOffice detected")
-		statusVariant := "success"
-		if _, err := pdfeng.FindSofficePath(u.sofficePath); err != nil {
-			sofficeStatus = u.t("pdf.libreoffice_missing", "LibreOffice (soffice) not found. Configure its path in Settings.")
-			statusVariant = "danger"
+		officeStatus := pdfeng.DetectOfficeEngines(u.sofficePath)
+		statusText := u.t("pdf.office_engine_missing", "No Office conversion engine found. Install LibreOffice, Microsoft Office (Windows), or Apple Pages/Numbers/Keynote (macOS).")
+		statusVariant := "danger"
+		if officeStatus.HasAny() {
+			statusText = fmt.Sprintf(u.t("pdf.office_engine_detected", "Detected: %s"), officeStatus.Summary())
+			statusVariant = "success"
 		}
 		nodes := []pluginapi.UINode{
-			liveNode("pdf.office.status", pluginapi.UINodeText, pluginapi.UITextProps{Text: sofficeStatus, Variant: statusVariant, FontSize: 12}),
+			liveNode("pdf.office.status", pluginapi.UINodeText, pluginapi.UITextProps{Text: statusText, Variant: statusVariant, FontSize: 12}),
 			u.buildSectionHeaderLocked("pdf.office.hdr", u.t("pdf.staged_files", "Staged Files"), len(u.officeFiles), "pdf.office.clear"),
 			liveNode("pdf.office.pick", pluginapi.UINodeFilePicker, pluginapi.UIFilePickerProps{
 				Label:      u.t("pdf.btn_add_office", "Add Documents..."),
 				Mode:       "open",
-				Extensions: []string{"doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf"},
+				Extensions: []string{"doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "pages", "numbers", "key"},
 				Multiple:   true,
 				Disabled:   u.running,
 			}),

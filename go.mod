@@ -4,11 +4,13 @@ go 1.27.3
 
 require (
 	github.com/ebitengine/purego v0.11.1
+	github.com/go-ole/go-ole v1.3.0
 	github.com/klippa-app/go-pdfium v1.21.4
 	github.com/pdfcpu/pdfcpu v0.16.4
-	github.com/seiortech/mtools-sdk v0.2.2
+	github.com/seiortech/mtools-sdk v0.2.3
 	github.com/tetratelabs/wazero v1.12.0
 	golang.org/x/image v0.47.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -20,6 +22,5 @@ require (
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 )

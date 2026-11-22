@@ -174,36 +174,13 @@ func FindSofficePath(customPath string) (string, error) {
 	return "", ErrMissingSoffice
 }
 
-// ConvertOfficeToPDF converts a document (.docx, .xlsx, .pptx, etc.) to PDF using headless LibreOffice.
+// ConvertOfficeToPDF converts a document (.docx, .xlsx, .pptx, etc.) to PDF
+// using the default (auto-detected) local Office engine.
 func ConvertOfficeToPDF(ctx context.Context, sofficePath string, inFile string, outDir string) (string, error) {
-	if inFile == "" {
-		return "", ErrEmptyInput
-	}
-	if sofficePath == "" {
-		var err error
-		sofficePath, err = FindSofficePath("")
-		if err != nil {
-			return "", err
-		}
-	}
-
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create destination directory: %w", err)
-	}
-
-	cmd := exec.CommandContext(ctx, sofficePath, "--headless", "--convert-to", "pdf", "--outdir", outDir, inFile)
-	prepareCommand(cmd)
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%w: %s (%v)", ErrConversionFailed, strings.TrimSpace(string(out)), err)
-	}
-
-	baseName := strings.TrimSuffix(filepath.Base(inFile), filepath.Ext(inFile))
-	outPDF := filepath.Join(outDir, baseName+".pdf")
-	if _, err := os.Stat(outPDF); err != nil {
-		return "", fmt.Errorf("%w: output PDF not generated: %v", ErrConversionFailed, err)
-	}
-
-	return outPDF, nil
+	return ConvertOfficeToPDFWithSpec(ctx, OfficeConvertSpec{
+		Engine:      OfficeEngineAuto,
+		SofficePath: sofficePath,
+		InputFile:   inFile,
+		OutputDir:   outDir,
+	})
 }
