@@ -283,6 +283,45 @@ func (s *pdfServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(pl
 			Summary: fmt.Sprintf("Converted %d document(s) to PDF", len(outputs)),
 		}, nil
 
+	case "fetch_pdfium":
+		targetDir := ""
+		if dirs := p.Inputs["output_dir"]; len(dirs) > 0 && strings.TrimSpace(dirs[0]) != "" {
+			targetDir = strings.TrimSpace(dirs[0])
+		}
+		if targetDir == "" {
+			targetDir = p.SharedToolsDir()
+		}
+		if targetDir == "" {
+			targetDir = strings.TrimSpace(p.Settings[pluginapi.SettingPluginDataDir])
+		}
+		if targetDir == "" {
+			return pluginapi.RunResult{}, errors.New("shared tools directory is unavailable")
+		}
+		targetPath := filepath.Join(targetDir, "pdfium.wasm")
+		_ = emit(pluginapi.Progress{
+			JobID:   p.JobID,
+			Done:    5,
+			Total:   100,
+			Unit:    "%",
+			Message: "Downloading pdfium.wasm...",
+		})
+		if err := pdf.DownloadPDFiumWASM(ctx, targetPath, func(done float64, msg string) {
+			_ = emit(pluginapi.Progress{
+				JobID:   p.JobID,
+				Done:    done * 100,
+				Total:   100,
+				Unit:    "%",
+				Message: msg,
+			})
+		}); err != nil {
+			return pluginapi.RunResult{}, err
+		}
+		return pluginapi.RunResult{
+			JobID:   p.JobID,
+			Outputs: []string{targetPath},
+			Summary: "Installed pdfium.wasm at " + targetPath,
+		}, nil
+
 	default:
 		return pluginapi.RunResult{}, errors.New("unknown action")
 	}

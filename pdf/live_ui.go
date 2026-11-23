@@ -89,8 +89,11 @@ type LiveUI struct {
 	lastSettings     map[string]string
 	pdfiumCustomPath string
 	history          *pdfeng.HistoryStore
-	renderer         pdfeng.PageRenderer
-	previewEngineErr error
+	renderer          pdfeng.PageRenderer
+	previewEngineErr  error
+	pdfiumDownloading bool
+	pdfiumDownloadMsg string
+	pdfiumDownloadErr string
 
 	activeTab string // "merge", "split", "images", "office"
 
@@ -340,6 +343,53 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 			u.pageCache.Clear()
 			u.clearPageAssetsLocked(session)
 			u.triggerVisiblePageRendersLocked(session)
+		} else {
+			shouldRender = false
+		}
+	case "download_pdfium":
+		if ev.Kind == pluginapi.UIEventClick && !u.pdfiumDownloading {
+			targetPath := ""
+			if u.sharedTools != nil {
+				targetPath = u.sharedTools.SharedToolPath("pdfium.wasm", false)
+			}
+			if targetPath == "" && u.dataDir != "" {
+				targetPath = filepath.Join(u.dataDir, "pdfium.wasm")
+			}
+			if targetPath == "" {
+				targetPath = filepath.Join(os.TempDir(), "mtools-tools", "pdfium.wasm")
+			}
+			u.pdfiumDownloading = true
+			u.pdfiumDownloadMsg = "Downloading pdfium.wasm..."
+			u.pdfiumDownloadErr = ""
+			go func(dest string) {
+				dlErr := pdfeng.DownloadPDFiumWASM(context.Background(), dest, func(_ float64, msg string) {
+					u.mu.Lock()
+					u.pdfiumDownloadMsg = msg
+					u.mu.Unlock()
+					_ = u.renderAndSend(session)
+				})
+				u.mu.Lock()
+				u.pdfiumDownloading = false
+				if dlErr != nil {
+					u.pdfiumDownloadErr = dlErr.Error()
+					u.pdfiumDownloadMsg = ""
+				} else {
+					u.pdfiumDownloadErr = ""
+					u.pdfiumDownloadMsg = ""
+					u.previewEngineErr = nil
+					u.previewRenderErr = make(map[pageAssetKey]string)
+					u.inFlightRenders = make(map[pageAssetKey]bool)
+					u.configureRendererLocked(nil)
+					if ec, ok := u.renderer.(interface{ CheckEngine() error }); ok {
+						u.previewEngineErr = ec.CheckEngine()
+					}
+					u.pageCache.Clear()
+					u.clearPageAssetsLocked(session)
+					u.triggerVisiblePageRendersLocked(session)
+				}
+				u.mu.Unlock()
+				_ = u.renderAndSend(session)
+			}(targetPath)
 		} else {
 			shouldRender = false
 		}

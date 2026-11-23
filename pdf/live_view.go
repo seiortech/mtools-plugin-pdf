@@ -393,6 +393,12 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		titleKey = "pdf.pdfium_invalid_title"
 		fallbackTitle = "PDFium preview engine failed to load"
 	}
+	dlLabel := u.t("pdf.btn_download_pdfium", "Download pdfium.wasm")
+	if u.pdfiumDownloading && u.pdfiumDownloadMsg != "" {
+		dlLabel = u.pdfiumDownloadMsg
+	} else if u.pdfiumDownloadErr != "" {
+		dlLabel = "Retry Download"
+	}
 	banner := liveNode("pdfium_engine_banner", pluginapi.UINodeRow, pluginapi.UIContainerProps{
 		Surface:     "paper",
 		BorderSize:  1,
@@ -420,11 +426,11 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 			NoFillWidth: true,
 		},
 			liveNode("download_pdfium", pluginapi.UINodeButton, pluginapi.UIButtonProps{
-				Label:          u.t("pdf.btn_download_pdfium", "Download pdfium.wasm"),
-				Variant:        "primary",
-				Icon:           "download",
-				HostAction:     "run_app_setting_action",
-				HostSettingKey: "fetch_pdfium",
+				Label:    dlLabel,
+				Variant:  "primary",
+				Icon:     "download",
+				Disabled: u.pdfiumDownloading,
+				Tooltip:  u.pdfiumDownloadErr,
 			}),
 			liveNode("open_settings", pluginapi.UINodeButton, pluginapi.UIButtonProps{
 				Label:      u.t("pdf.btn_open_settings", "Open App Settings"),
