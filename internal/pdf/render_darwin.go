@@ -8,6 +8,7 @@ import (
 	"image"
 	"math"
 	"os"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -33,6 +34,7 @@ var (
 	darwinInitOnce sync.Once
 	darwinInitErr  error
 
+	cgDataProviderCreateWithFilename func(filename string) uintptr
 	cgDataProviderCreateWithData     func(info unsafe.Pointer, data unsafe.Pointer, size uintptr, releaseData unsafe.Pointer) uintptr
 	cgPDFDocumentCreateWithProvider  func(provider uintptr) uintptr
 	cgPDFDocumentGetNumberOfPages    func(doc uintptr) uintptr
@@ -68,6 +70,8 @@ const (
 	kCGBitmapByteOrder32Big        = 4 << 12
 
 	kCGInterpolationHigh = 3
+
+	maxCGMemoryFallbackBytes = 16 << 20 // 16 MiB cap for in-memory fallback reads
 )
 
 func initCoreGraphics() error {
@@ -78,6 +82,7 @@ func initCoreGraphics() error {
 			return
 		}
 
+		purego.RegisterLibFunc(&cgDataProviderCreateWithFilename, cgLib, "CGDataProviderCreateWithFilename")
 		purego.RegisterLibFunc(&cgDataProviderCreateWithData, cgLib, "CGDataProviderCreateWithData")
 		purego.RegisterLibFunc(&cgPDFDocumentCreateWithProvider, cgLib, "CGPDFDocumentCreateWithProvider")
 		purego.RegisterLibFunc(&cgPDFDocumentGetNumberOfPages, cgLib, "CGPDFDocumentGetNumberOfPages")
@@ -108,47 +113,9 @@ func initCoreGraphics() error {
 }
 
 // DarwinCoreGraphicsRenderer renders PDF pages natively using macOS CoreGraphics via purego.
+// It streams PDFs via CGDataProviderCreateWithFilename so large files never copy into Go heap.
 type DarwinCoreGraphicsRenderer struct {
 	fallback PageRenderer
-
-	fileMu     sync.Mutex
-	cachedPath string
-	cachedSize int64
-	cachedMod  int64
-	cachedData []byte
-}
-
-func (r *DarwinCoreGraphicsRenderer) readPDFBytes(pdfPath string) ([]byte, error) {
-	info, err := os.Stat(pdfPath)
-	if err != nil {
-		return nil, fmt.Errorf("stat pdf %s: %w", pdfPath, err)
-	}
-	size := info.Size()
-	mod := info.ModTime().UnixNano()
-
-	r.fileMu.Lock()
-	if r.cachedPath == pdfPath && r.cachedSize == size && r.cachedMod == mod && len(r.cachedData) > 0 {
-		data := r.cachedData
-		r.fileMu.Unlock()
-		return data, nil
-	}
-	r.fileMu.Unlock()
-
-	data, err := os.ReadFile(pdfPath)
-	if err != nil {
-		return nil, fmt.Errorf("read pdf %s: %w", pdfPath, err)
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("empty pdf %s", pdfPath)
-	}
-
-	r.fileMu.Lock()
-	r.cachedPath = pdfPath
-	r.cachedSize = size
-	r.cachedMod = mod
-	r.cachedData = data
-	r.fileMu.Unlock()
-	return data, nil
 }
 
 func defaultPlatformRenderer() PageRenderer {
@@ -157,81 +124,159 @@ func defaultPlatformRenderer() PageRenderer {
 	}
 }
 
-func (r *DarwinCoreGraphicsRenderer) PageCount(ctx context.Context, pdfPath string) (int, error) {
-	if err := initCoreGraphics(); err != nil {
-		return r.fallback.PageCount(ctx, pdfPath)
+// Close releases renderer state (no-op for stateless streaming CoreGraphics renderer).
+func (r *DarwinCoreGraphicsRenderer) Close() error {
+	return nil
+}
+
+// openCGDoc opens a CGPDFDocument backed by file streaming (zero Go heap copy).
+// Caller must invoke cleanup() when finished; cleanup releases doc, provider, and keeps any fallback slice alive.
+func openCGDoc(pdfPath string) (doc uintptr, cleanup func(), err error) {
+	info, statErr := os.Stat(pdfPath)
+	if statErr != nil {
+		return 0, nil, fmt.Errorf("stat pdf %s: %w", pdfPath, statErr)
+	}
+	if info.IsDir() || info.Size() <= 0 {
+		return 0, nil, fmt.Errorf("empty or invalid pdf %s", pdfPath)
 	}
 
-	data, err := r.readPDFBytes(pdfPath)
-	if err != nil {
-		return 0, err
+	if cgDataProviderCreateWithFilename != nil {
+		if provider := cgDataProviderCreateWithFilename(pdfPath); provider != 0 {
+			if d := cgPDFDocumentCreateWithProvider(provider); d != 0 {
+				return d, func() {
+					cgPDFDocumentRelease(d)
+					cgDataProviderRelease(provider)
+				}, nil
+			}
+			cgDataProviderRelease(provider)
+		}
+	}
+
+	if info.Size() > maxCGMemoryFallbackBytes {
+		return 0, nil, fmt.Errorf("failed to open pdf document %s via CoreGraphics file provider", pdfPath)
+	}
+	data, readErr := os.ReadFile(pdfPath)
+	if readErr != nil {
+		return 0, nil, fmt.Errorf("read pdf %s: %w", pdfPath, readErr)
+	}
+	if len(data) == 0 {
+		return 0, nil, fmt.Errorf("empty pdf %s", pdfPath)
 	}
 
 	provider := cgDataProviderCreateWithData(nil, unsafe.Pointer(&data[0]), uintptr(len(data)), nil)
 	if provider == 0 {
-		return r.fallback.PageCount(ctx, pdfPath)
+		runtime.KeepAlive(data)
+		return 0, nil, fmt.Errorf("failed to create CoreGraphics data provider")
 	}
-	defer cgDataProviderRelease(provider)
+	d := cgPDFDocumentCreateWithProvider(provider)
+	if d == 0 {
+		cgDataProviderRelease(provider)
+		runtime.KeepAlive(data)
+		return 0, nil, fmt.Errorf("failed to create CoreGraphics pdf document")
+	}
+	return d, func() {
+		cgPDFDocumentRelease(d)
+		cgDataProviderRelease(provider)
+		runtime.KeepAlive(data)
+	}, nil
+}
 
-	doc := cgPDFDocumentCreateWithProvider(provider)
-	if doc == 0 {
+func cgPageVisualBox(page uintptr) (box cgRect, rot int, visW, visH float64) {
+	box = cgPDFPageGetBoxRect(page, kCGPDFCropBox)
+	if box.size.width <= 0 || box.size.height <= 0 {
+		box = cgPDFPageGetBoxRect(page, kCGPDFMediaBox)
+	}
+	if cgPDFPageGetRotationAngle != nil {
+		rot = ((int(cgPDFPageGetRotationAngle(page)) % 360) + 360) % 360
+	}
+	visW, visH = box.size.width, box.size.height
+	if rot == 90 || rot == 270 {
+		visW, visH = visH, visW
+	}
+	return box, rot, visW, visH
+}
+
+func (r *DarwinCoreGraphicsRenderer) PageCount(ctx context.Context, pdfPath string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := initCoreGraphics(); err != nil {
 		return r.fallback.PageCount(ctx, pdfPath)
 	}
-	defer cgPDFDocumentRelease(doc)
+
+	doc, cleanup, err := openCGDoc(pdfPath)
+	if err != nil {
+		return r.fallback.PageCount(ctx, pdfPath)
+	}
+	defer cleanup()
 
 	return int(cgPDFDocumentGetNumberOfPages(doc)), nil
 }
 
-func (r *DarwinCoreGraphicsRenderer) PageDimensions(ctx context.Context, pdfPath string, pageNum int) (float64, float64, error) {
-	f, err := os.Open(pdfPath)
-	if err == nil {
-		dims, err := api.PageDims(ctx, f, model.NewStatelessConfiguration())
-		f.Close()
-		if err == nil && pageNum >= 1 && pageNum <= len(dims) {
-			dim := dims[pageNum-1]
-			return dim.Width, dim.Height, nil
+// AllPageDimensions returns all page visual dimensions in points in a single parse pass.
+func (r *DarwinCoreGraphicsRenderer) AllPageDimensions(ctx context.Context, pdfPath string) ([]PageDim, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f, err := os.Open(pdfPath); err == nil {
+		dims, dimErr := api.PageDims(ctx, f, model.NewStatelessConfiguration())
+		_ = f.Close()
+		if dimErr == nil && len(dims) > 0 {
+			out := make([]PageDim, len(dims))
+			for i, d := range dims {
+				out[i] = PageDim{Width: d.Width, Height: d.Height}
+			}
+			return out, nil
 		}
 	}
 
 	if err := initCoreGraphics(); err != nil {
-		return r.fallback.PageDimensions(ctx, pdfPath, pageNum)
+		return AllPageDimensions(ctx, r.fallback, pdfPath)
 	}
 
-	data, err := r.readPDFBytes(pdfPath)
+	doc, cleanup, err := openCGDoc(pdfPath)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	total := int(cgPDFDocumentGetNumberOfPages(doc))
+	if total <= 0 {
+		return nil, nil
+	}
+	out := make([]PageDim, total)
+	for p := 1; p <= total; p++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		page := cgPDFDocumentGetPage(doc, uintptr(p))
+		if page == 0 {
+			return nil, fmt.Errorf("failed to get page %d", p)
+		}
+		_, _, visW, visH := cgPageVisualBox(page)
+		out[p-1] = PageDim{Width: visW, Height: visH}
+	}
+	return out, nil
+}
+
+func (r *DarwinCoreGraphicsRenderer) PageDimensions(ctx context.Context, pdfPath string, pageNum int) (float64, float64, error) {
+	if pageNum < 1 {
+		return 0, 0, ErrPageOutOfRange
+	}
+	dims, err := r.AllPageDimensions(ctx, pdfPath)
 	if err != nil {
 		return 0, 0, err
 	}
-
-	provider := cgDataProviderCreateWithData(nil, unsafe.Pointer(&data[0]), uintptr(len(data)), nil)
-	if provider == 0 {
-		return 0, 0, fmt.Errorf("failed to create data provider")
-	}
-	defer cgDataProviderRelease(provider)
-
-	doc := cgPDFDocumentCreateWithProvider(provider)
-	if doc == 0 {
-		return 0, 0, fmt.Errorf("failed to create pdf document")
-	}
-	defer cgPDFDocumentRelease(doc)
-
-	total := int(cgPDFDocumentGetNumberOfPages(doc))
-	if pageNum < 1 || pageNum > total {
+	if pageNum > len(dims) {
 		return 0, 0, ErrPageOutOfRange
 	}
-
-	page := cgPDFDocumentGetPage(doc, uintptr(pageNum))
-	if page == 0 {
-		return 0, 0, fmt.Errorf("failed to get page %d", pageNum)
-	}
-
-	box := cgPDFPageGetBoxRect(page, kCGPDFCropBox)
-	if box.size.width <= 0 || box.size.height <= 0 {
-		box = cgPDFPageGetBoxRect(page, kCGPDFMediaBox)
-	}
-	return box.size.width, box.size.height, nil
+	return dims[pageNum-1].Width, dims[pageNum-1].Height, nil
 }
 
 func (r *DarwinCoreGraphicsRenderer) RenderPage(ctx context.Context, pdfPath string, pageNum int, scale float64) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if scale <= 0 {
 		scale = 1.0
 	}
@@ -240,25 +285,14 @@ func (r *DarwinCoreGraphicsRenderer) RenderPage(ctx context.Context, pdfPath str
 		return r.fallback.RenderPage(ctx, pdfPath, pageNum, scale)
 	}
 
-	data, err := r.readPDFBytes(pdfPath)
+	doc, cleanup, err := openCGDoc(pdfPath)
 	if err != nil {
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("empty pdf %s", pdfPath)
-	}
-
-	provider := cgDataProviderCreateWithData(nil, unsafe.Pointer(&data[0]), uintptr(len(data)), nil)
-	if provider == 0 {
+		if _, statErr := os.Stat(pdfPath); statErr != nil {
+			return nil, err
+		}
 		return r.fallback.RenderPage(ctx, pdfPath, pageNum, scale)
 	}
-	defer cgDataProviderRelease(provider)
-
-	doc := cgPDFDocumentCreateWithProvider(provider)
-	if doc == 0 {
-		return r.fallback.RenderPage(ctx, pdfPath, pageNum, scale)
-	}
-	defer cgPDFDocumentRelease(doc)
+	defer cleanup()
 
 	total := int(cgPDFDocumentGetNumberOfPages(doc))
 	if pageNum < 1 || pageNum > total {
@@ -270,28 +304,23 @@ func (r *DarwinCoreGraphicsRenderer) RenderPage(ctx context.Context, pdfPath str
 		return nil, fmt.Errorf("failed to get page %d", pageNum)
 	}
 
-	box := cgPDFPageGetBoxRect(page, kCGPDFCropBox)
-	if box.size.width <= 0 || box.size.height <= 0 {
-		box = cgPDFPageGetBoxRect(page, kCGPDFMediaBox)
-	}
-
-	rot := 0
-	if cgPDFPageGetRotationAngle != nil {
-		rot = ((int(cgPDFPageGetRotationAngle(page)) % 360) + 360) % 360
-	}
-	visW := box.size.width
-	visH := box.size.height
-	if rot == 90 || rot == 270 {
-		visW, visH = visH, visW
-	}
-
-	const renderHiDPIScale = 2.0
-	actualScale := scale * renderHiDPIScale
+	box, rot, visW, visH := cgPageVisualBox(page)
+	actualScale := computeAdaptiveRenderScale(scale, visW, visH, defaultRenderMaxDimPx, defaultRenderMaxPixels)
 
 	w := int(math.Ceil(visW * actualScale))
 	h := int(math.Ceil(visH * actualScale))
+	if w > defaultRenderMaxDimPx {
+		w = defaultRenderMaxDimPx
+	}
+	if h > defaultRenderMaxDimPx {
+		h = defaultRenderMaxDimPx
+	}
 	if w <= 0 || h <= 0 {
 		return nil, fmt.Errorf("invalid page dimensions: %vx%v", w, h)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	colorSpace := cgColorSpaceCreateDeviceRGB()
@@ -351,3 +380,8 @@ func (r *DarwinCoreGraphicsRenderer) RenderPage(ctx context.Context, pdfPath str
 
 	return img, nil
 }
+
+var (
+	_ PageRenderer           = (*DarwinCoreGraphicsRenderer)(nil)
+	_ BatchDimensionRenderer = (*DarwinCoreGraphicsRenderer)(nil)
+)

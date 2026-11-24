@@ -26,6 +26,22 @@ const (
 	msoTrue           = -1
 )
 
+func putProp(disp *ole.IDispatch, name string, params ...any) error {
+	v, err := oleutil.PutProperty(disp, name, params...)
+	if v != nil {
+		_ = v.Clear()
+	}
+	return err
+}
+
+func callMethodDiscard(disp *ole.IDispatch, name string, params ...any) error {
+	v, err := oleutil.CallMethod(disp, name, params...)
+	if v != nil {
+		_ = v.Clear()
+	}
+	return err
+}
+
 func detectMSOfficeApps() []string {
 	type probe struct {
 		name   string
@@ -103,12 +119,12 @@ func convertWithWordCOM(ctx context.Context, inAbs, outPDF string) error {
 	}
 	defer word.Release()
 	defer func() {
-		_, _ = oleutil.CallMethod(word, "Quit", false)
+		_ = callMethodDiscard(word, "Quit", false)
 	}()
 
-	_, _ = oleutil.PutProperty(word, "Visible", false)
-	_, _ = oleutil.PutProperty(word, "DisplayAlerts", 0)
-	_, _ = oleutil.PutProperty(word, "AutomationSecurity", msoAutomationSecurityForceDisable)
+	_ = putProp(word, "Visible", false)
+	_ = putProp(word, "DisplayAlerts", 0)
+	_ = putProp(word, "AutomationSecurity", msoAutomationSecurityForceDisable)
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -129,13 +145,13 @@ func convertWithWordCOM(ctx context.Context, inAbs, outPDF string) error {
 	doc := docVar.ToIDispatch()
 	defer doc.Release()
 	defer func() {
-		_, _ = oleutil.CallMethod(doc, "Close", false)
+		_ = callMethodDiscard(doc, "Close", false)
 	}()
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := oleutil.CallMethod(doc, "ExportAsFixedFormat", outPDF, wdExportFormatPDF); err != nil {
+	if err := callMethodDiscard(doc, "ExportAsFixedFormat", outPDF, wdExportFormatPDF); err != nil {
 		return fmt.Errorf("%w: Word PDF export failed: %v", ErrConversionFailed, err)
 	}
 	return nil
@@ -154,12 +170,12 @@ func convertWithExcelCOM(ctx context.Context, inAbs, outPDF string) error {
 	}
 	defer excel.Release()
 	defer func() {
-		_, _ = oleutil.CallMethod(excel, "Quit")
+		_ = callMethodDiscard(excel, "Quit")
 	}()
 
-	_, _ = oleutil.PutProperty(excel, "Visible", false)
-	_, _ = oleutil.PutProperty(excel, "DisplayAlerts", false)
-	_, _ = oleutil.PutProperty(excel, "AutomationSecurity", msoAutomationSecurityForceDisable)
+	_ = putProp(excel, "Visible", false)
+	_ = putProp(excel, "DisplayAlerts", false)
+	_ = putProp(excel, "AutomationSecurity", msoAutomationSecurityForceDisable)
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -180,13 +196,13 @@ func convertWithExcelCOM(ctx context.Context, inAbs, outPDF string) error {
 	wb := wbVar.ToIDispatch()
 	defer wb.Release()
 	defer func() {
-		_, _ = oleutil.CallMethod(wb, "Close", false)
+		_ = callMethodDiscard(wb, "Close", false)
 	}()
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := oleutil.CallMethod(wb, "ExportAsFixedFormat", xlTypePDF, outPDF); err != nil {
+	if err := callMethodDiscard(wb, "ExportAsFixedFormat", xlTypePDF, outPDF); err != nil {
 		return fmt.Errorf("%w: Excel PDF export failed: %v", ErrConversionFailed, err)
 	}
 	return nil
@@ -205,10 +221,10 @@ func convertWithPowerPointCOM(ctx context.Context, inAbs, outPDF string) error {
 	}
 	defer ppt.Release()
 	defer func() {
-		_, _ = oleutil.CallMethod(ppt, "Quit")
+		_ = callMethodDiscard(ppt, "Quit")
 	}()
 
-	_, _ = oleutil.PutProperty(ppt, "AutomationSecurity", msoAutomationSecurityForceDisable)
+	_ = putProp(ppt, "AutomationSecurity", msoAutomationSecurityForceDisable)
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -229,13 +245,13 @@ func convertWithPowerPointCOM(ctx context.Context, inAbs, outPDF string) error {
 	doc := docVar.ToIDispatch()
 	defer doc.Release()
 	defer func() {
-		_, _ = oleutil.CallMethod(doc, "Close")
+		_ = callMethodDiscard(doc, "Close")
 	}()
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := oleutil.CallMethod(doc, "SaveAs", outPDF, ppSaveAsPDF); err != nil {
+	if err := callMethodDiscard(doc, "SaveAs", outPDF, ppSaveAsPDF); err != nil {
 		return fmt.Errorf("%w: PowerPoint PDF export failed: %v", ErrConversionFailed, err)
 	}
 	return nil

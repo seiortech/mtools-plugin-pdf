@@ -217,6 +217,44 @@ func (u *LiveUI) runActionMetaLocked() (label, icon string) {
 	}
 }
 
+// appendChunkedSpacers collapses a contiguous vertical run of off-window pages into
+// <=8000px spacer chunks so very large PDFs stay far below MaxUINodes (2048) and
+// preserve exact scroll geometry with the scroll column's pageGap.
+func appendChunkedSpacers(out []pluginapi.UINode, prefix string, totalH, width, pageGap int) []pluginapi.UINode {
+	if totalH <= 0 {
+		return out
+	}
+	const maxChunkH = 8000
+	if width < 100 {
+		width = 100
+	}
+	if width > 8192 {
+		width = 8192
+	}
+	rem := totalH
+	idx := 0
+	for rem > 0 {
+		var chunkH int
+		if rem <= maxChunkH {
+			chunkH = rem
+			rem = 0
+		} else {
+			chunkH = min(maxChunkH, rem-pageGap-1)
+			if chunkH < 1 {
+				chunkH = 1
+			}
+			rem -= chunkH + pageGap
+		}
+		out = append(out, liveNode(fmt.Sprintf("%s_%d", prefix, idx), pluginapi.UINodeColumn, pluginapi.UIContainerProps{
+			Width:       width,
+			Height:      chunkH,
+			NoFillWidth: true,
+		}))
+		idx++
+	}
+	return out
+}
+
 func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 	if len(u.previewPages) == 0 {
 		if u.activeTab == "office" && len(u.officeFiles) > 0 {
@@ -225,6 +263,7 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		return u.buildEmptyPreviewLocked()
 	}
 
+	const pageGap = 24
 	z := u.effectiveZoomLocked()
 	includedMap := map[int]bool{}
 	if u.activeTab == "split" && u.splitMode == "range" {
@@ -237,39 +276,61 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		}
 	}
 
-	pageNodes := make([]pluginapi.UINode, 0, len(u.previewPages))
-	for _, pg := range u.previewPages {
+	total := len(u.previewPages)
+	winStart := max(u.currentPage-4, 1)
+	winEnd := min(u.currentPage+4, total)
+
+	aboveH, aboveW := 0, 0
+	for p := 1; p < winStart; p++ {
+		pg := u.previewPages[p-1]
 		pw := min(max(int(math.Round(pg.W*z)), 100), 8192)
 		ph := min(max(int(math.Round(pg.H*z)), 100), 8192)
-
-		if absInt(pg.GlobalPage-u.currentPage) > 4 {
-			pageNodes = append(pageNodes, liveNode(fmt.Sprintf("page_spacer_%d", pg.GlobalPage), pluginapi.UINodeColumn, pluginapi.UIContainerProps{
-				Width:       pw,
-				Height:      ph,
-				Surface:     "paper",
-				BorderSize:  1,
-				NoFillWidth: true,
-				Justify:     "center",
-				Align:       "center",
-			},
-				liveNode(fmt.Sprintf("page_spacer_lbl_%d", pg.GlobalPage), pluginapi.UINodeText, pluginapi.UITextProps{
-					Text:    fmt.Sprintf("Page %d", pg.GlobalPage),
-					Variant: "muted",
-				}),
-			))
-			continue
+		if pw > aboveW {
+			aboveW = pw
 		}
+		if aboveH > 0 {
+			aboveH += pageGap
+		}
+		aboveH += ph
+	}
+
+	belowH, belowW := 0, 0
+	for p := winEnd + 1; p <= total; p++ {
+		pg := u.previewPages[p-1]
+		pw := min(max(int(math.Round(pg.W*z)), 100), 8192)
+		ph := min(max(int(math.Round(pg.H*z)), 100), 8192)
+		if pw > belowW {
+			belowW = pw
+		}
+		if belowH > 0 {
+			belowH += pageGap
+		}
+		belowH += ph
+	}
+
+	pageNodes := make([]pluginapi.UINode, 0, (winEnd-winStart+1)+16)
+	pageNodes = appendChunkedSpacers(pageNodes, "page_spacer_above", aboveH, aboveW, pageGap)
+
+	for p := winStart; p <= winEnd; p++ {
+		pg := u.previewPages[p-1]
+		pw := min(max(int(math.Round(pg.W*z)), 100), 8192)
+		ph := min(max(int(math.Round(pg.H*z)), 100), 8192)
 
 		assetRef := u.pageAssetRefLocked(pg)
 		var canvasChildren []pluginapi.UINode
 		if assetRef == "" {
 			loadingText := u.t("pdf.rendering_page", "Rendering page...")
 			loadingVariant := "muted"
-			for ek, emsg := range u.previewRenderErr {
-				if ek.docGen == u.docGen && ek.sourcePath == pg.SourcePath && ek.pageNum == pg.PDFPage && emsg != "" {
-					loadingText = u.t("pdf.preview_render_failed", "Page preview failed to render")
-					loadingVariant = "danger"
-					break
+			if pg.Kind == "image" {
+				loadingText = u.t("pdf.preview_render_failed", "Page preview failed to render")
+				loadingVariant = "danger"
+			} else {
+				for ek, emsg := range u.previewRenderErr {
+					if ek.docGen == u.docGen && ek.sourcePath == pg.SourcePath && ek.pageNum == pg.PDFPage && emsg != "" {
+						loadingText = u.t("pdf.preview_render_failed", "Page preview failed to render")
+						loadingVariant = "danger"
+						break
+					}
 				}
 			}
 			canvasChildren = append(canvasChildren, liveNode(fmt.Sprintf("page_loading_%d", pg.GlobalPage), pluginapi.UINodeColumn, pluginapi.UIContainerProps{
@@ -366,18 +427,21 @@ func (u *LiveUI) buildPreviewPaneLocked() pluginapi.UINode {
 		}, canvasChildren...))
 	}
 
+	pageNodes = appendChunkedSpacers(pageNodes, "page_spacer_below", belowH, belowW, pageGap)
+
+	scrollY := min(max(u.targetScrollY, 0), maxScrollTargetY)
 	viewportNode := liveNode("pdf.viewport", pluginapi.UINodeScroll, pluginapi.UIContainerProps{
 		Fill:        true,
 		Grow:        true,
 		Padding:     24,
-		Gap:         24,
+		Gap:         pageGap,
 		Align:       "center",
 		Justify:     "center",
 		Surface:     "ground",
 		ScrollBoth:  true,
 		TrackScroll: true,
 		ScrollTarget: &pluginapi.UIScrollTarget{
-			Y:      u.targetScrollY,
+			Y:      scrollY,
 			Seq:    u.scrollSeq,
 			Smooth: u.scrollSeq > 1,
 		},
@@ -483,11 +547,11 @@ func (u *LiveUI) buildEmptyPreviewLocked() pluginapi.UINode {
 		multi = true
 	case "office":
 		title = u.t("pdf.empty_office_title", "Convert Office Documents")
-		desc = u.t("pdf.empty_office_desc", "Add Word, Excel, PowerPoint, or OpenDocument files to convert locally via LibreOffice.")
+		desc = u.t("pdf.empty_office_desc", "Add Word, Excel, PowerPoint, iWork, or OpenDocument files to convert locally to PDF.")
 		btnLabel = u.t("pdf.btn_add_office", "Add Documents...")
 		icon = "office"
 		pickID = "pdf.office.empty_pick"
-		exts = []string{"doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf"}
+		exts = []string{"doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "pages", "numbers", "key"}
 		multi = true
 	}
 
@@ -520,7 +584,7 @@ func (u *LiveUI) buildEmptyPreviewLocked() pluginapi.UINode {
 func (u *LiveUI) buildOfficePreviewLedgerLocked() pluginapi.UINode {
 	cards := []pluginapi.UINode{
 		liveNode("pdf.office.preview_hint", pluginapi.UINodeText, pluginapi.UITextProps{
-			Text:    u.t("pdf.office_preview_hint", "Office documents are rendered by LibreOffice during conversion. Click Convert Documents to generate and preview the PDF."),
+			Text:    u.t("pdf.office_preview_hint", "Office documents are rendered by your local Office engine during conversion. Click Convert Documents to generate and preview the PDF."),
 			Variant: "muted",
 		}),
 	}
@@ -674,12 +738,9 @@ func (u *LiveUI) buildStatusBannerLocked() *pluginapi.UINode {
 				Variant: "on_field",
 			}),
 		}
-		if u.resultAuthorized && len(u.resultOutputs) == 1 && u.resultOutputs[0] != "" {
+		if len(u.resultOutputs) > 0 && u.resultOutputs[0] != "" && (u.resultAuthorized || u.outputDir != "") {
 			outPath := u.resultOutputs[0]
-			children = append(children, liveNode("pdf.result.actions", pluginapi.UINodeRow, pluginapi.UIContainerProps{
-				Gap:  6,
-				Wrap: true,
-			},
+			actButtons := []pluginapi.UINode{
 				liveNode("pdf.reveal_btn", pluginapi.UINodeButton, pluginapi.UIButtonProps{
 					Label:       u.t("pdf.btn_reveal", "Reveal in Folder"),
 					Variant:     "secondary",
@@ -687,14 +748,20 @@ func (u *LiveUI) buildStatusBannerLocked() *pluginapi.UINode {
 					ShellPath:   outPath,
 					Height:      28,
 				}),
-				liveNode("pdf.open_btn", pluginapi.UINodeButton, pluginapi.UIButtonProps{
+			}
+			if len(u.resultOutputs) == 1 {
+				actButtons = append(actButtons, liveNode("pdf.open_btn", pluginapi.UINodeButton, pluginapi.UIButtonProps{
 					Label:       u.t("pdf.btn_open", "Open PDF"),
 					Variant:     "primary",
 					ShellAction: "open",
 					ShellPath:   outPath,
 					Height:      28,
-				}),
-			))
+				}))
+			}
+			children = append(children, liveNode("pdf.result.actions", pluginapi.UINodeRow, pluginapi.UIContainerProps{
+				Gap:  6,
+				Wrap: true,
+			}, actButtons...))
 		} else if len(u.resultOutputs) > 0 {
 			children = append(children, liveNode("pdf.result.dir", pluginapi.UINodeText, pluginapi.UITextProps{
 				Text:       filepath.Dir(u.resultOutputs[0]),
@@ -779,6 +846,15 @@ func (u *LiveUI) buildModeControlsLocked() []pluginapi.UINode {
 					Placeholder: "e.g. 1-3, 5, 8-10",
 					Disabled:    u.running,
 				}),
+			)
+			if u.splitRangeErr != "" {
+				nodes = append(nodes, liveNode("pdf.split.range_err", pluginapi.UINodeText, pluginapi.UITextProps{
+					Text:     u.splitRangeErr,
+					Variant:  "danger",
+					FontSize: 11,
+				}))
+			}
+			nodes = append(nodes,
 				liveNode("pdf.split.outlbl", pluginapi.UINodeText, pluginapi.UITextProps{Text: u.t("pdf.output_name", "Output Filename"), Variant: "muted", FontSize: 12, FontWeight: 600}),
 				liveNode("pdf.split.outname", pluginapi.UINodeTextInput, pluginapi.UITextInputProps{
 					Value:       u.splitOutputName,
@@ -795,6 +871,13 @@ func (u *LiveUI) buildModeControlsLocked() []pluginapi.UINode {
 					Disabled:    u.running,
 				}),
 			)
+			if u.splitSpanErr != "" {
+				nodes = append(nodes, liveNode("pdf.split.span_err", pluginapi.UINodeText, pluginapi.UITextProps{
+					Text:     u.splitSpanErr,
+					Variant:  "danger",
+					FontSize: 11,
+				}))
+			}
 		}
 		nodes = append(nodes, liveNode("pdf.outdir", pluginapi.UINodeDirPicker, pluginapi.UIDirPickerProps{
 			Label: u.t("pdf.save_dest", "Save Destination"), Value: u.outputDir, Disabled: u.running,
@@ -821,7 +904,7 @@ func (u *LiveUI) buildModeControlsLocked() []pluginapi.UINode {
 		return nodes
 
 	case "office":
-		officeStatus := pdfeng.DetectOfficeEngines(u.sofficePath)
+		officeStatus := u.officeStatus
 		statusText := u.t("pdf.office_engine_missing", "No Office conversion engine found. Install LibreOffice, Microsoft Office (Windows), or Apple Pages/Numbers/Keynote (macOS).")
 		statusVariant := "danger"
 		if officeStatus.HasAny() {
@@ -875,6 +958,7 @@ func (u *LiveUI) buildFileListLocked(prefix string, items []liveFileItem, reorde
 	if len(items) == 0 {
 		return nil
 	}
+	showThumbs := len(items) <= 12
 	out := make([]pluginapi.UINode, 0, len(items))
 	for i, it := range items {
 		id := fmt.Sprintf("%s.%d", prefix, i)
@@ -887,13 +971,17 @@ func (u *LiveUI) buildFileListLocked(prefix string, items []liveFileItem, reorde
 			}
 		}
 		var rowChildren []pluginapi.UINode
-		if it.AssetRef != "" {
+		if showThumbs && it.AssetRef != "" {
 			rowChildren = append(rowChildren, liveNode(id+".thumb", pluginapi.UINodeImage, pluginapi.UIImageProps{
 				Src: it.AssetRef, Fit: "contain", Width: 32, Height: 32,
 			}))
 		} else {
+			iconName := "file-text"
+			if it.AssetRef != "" || it.ImgW > 0 {
+				iconName = "image"
+			}
 			rowChildren = append(rowChildren, liveNode(id+".ic", pluginapi.UINodeIcon, pluginapi.UIIconProps{
-				Name: "file-text", Size: 16, Tone: "muted",
+				Name: iconName, Size: 16, Tone: "muted",
 			}))
 		}
 		rowChildren = append(rowChildren,
@@ -926,14 +1014,45 @@ func (u *LiveUI) buildFileListLocked(prefix string, items []liveFileItem, reorde
 	return out
 }
 
-func (u *LiveUI) buildPageJumpLocked() pluginapi.UINode {
-	total := len(u.previewPages)
-	maxChips := total
-	if maxChips > 24 {
-		maxChips = 24
+func quickJumpPageNumbers(current, total, maxChips int) []int {
+	if total <= 0 || maxChips <= 0 {
+		return nil
 	}
-	chips := make([]pluginapi.UINode, 0, maxChips)
-	for p := 1; p <= maxChips; p++ {
+	if total <= maxChips {
+		pages := make([]int, total)
+		for i := range pages {
+			pages[i] = i + 1
+		}
+		return pages
+	}
+	if current < 1 {
+		current = 1
+	} else if current > total {
+		current = total
+	}
+	midSlots := maxChips - 2
+	start := current - midSlots/2
+	if start < 2 {
+		start = 2
+	}
+	end := start + midSlots - 1
+	if end > total-1 {
+		end = total - 1
+		start = max(2, end-midSlots+1)
+	}
+	pages := make([]int, 0, maxChips)
+	pages = append(pages, 1)
+	for p := start; p <= end; p++ {
+		pages = append(pages, p)
+	}
+	pages = append(pages, total)
+	return pages
+}
+
+func (u *LiveUI) buildPageJumpLocked() pluginapi.UINode {
+	pages := quickJumpPageNumbers(u.currentPage, len(u.previewPages), 24)
+	chips := make([]pluginapi.UINode, 0, len(pages))
+	for _, p := range pages {
 		variant := "secondary"
 		if p == u.currentPage {
 			variant = "primary"

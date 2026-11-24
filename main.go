@@ -335,6 +335,7 @@ func main() {
 	}
 	server := &pdfServer{}
 	live := pdfui.NewLiveUI()
+	defer func() { _ = live.Close(context.Background()) }()
 	if err := pluginapi.ServeLive(context.Background(), os.Stdin, os.Stdout, identity, server, live); err != nil {
 		os.Exit(1)
 	}

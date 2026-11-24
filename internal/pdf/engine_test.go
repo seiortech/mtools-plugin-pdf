@@ -169,3 +169,50 @@ func TestFindSofficePath(t *testing.T) {
 		t.Fatalf("expected ErrMissingSoffice, got: %v", err)
 	}
 }
+
+func TestSplitPDFStagedIgnoresPreExistingFiles(t *testing.T) {
+	dir, ctx := t.TempDir(), t.Context()
+	img1, img2 := filepath.Join(dir, "1.png"), filepath.Join(dir, "2.png")
+	createTestPNG(t, img1, color.RGBA{R: 255, A: 255})
+	createTestPNG(t, img2, color.RGBA{B: 255, A: 255})
+	merged := filepath.Join(dir, "merged.pdf")
+	if err := ImagesToPDF(ctx, []string{img1, img2}, merged); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	preExisting := filepath.Join(outDir, "merged_99.pdf")
+	const sentinel = "pre-existing file"
+	if err := os.WriteFile(preExisting, []byte(sentinel), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	outputs, err := SplitPDF(ctx, merged, outDir, 1)
+	if err != nil {
+		t.Fatalf("SplitPDF: %v", err)
+	}
+	if len(outputs) != 2 {
+		t.Fatalf("expected 2 outputs (excluding pre-existing merged_99.pdf), got %d: %v", len(outputs), outputs)
+	}
+	for _, out := range outputs {
+		if filepath.Base(out) == "merged_99.pdf" {
+			t.Fatalf("SplitPDF returned pre-existing file: %v", outputs)
+		}
+	}
+	gotSentinel, err := os.ReadFile(preExisting)
+	if err != nil || string(gotSentinel) != sentinel {
+		t.Fatalf("pre-existing file was modified: %q %v", gotSentinel, err)
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Fatalf("staging directory leaked in outDir: %s", e.Name())
+		}
+	}
+}

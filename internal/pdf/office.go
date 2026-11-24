@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -311,8 +312,27 @@ func ConvertOfficeToPDFWithSpec(ctx context.Context, spec OfficeConvertSpec) (st
 	return finalPDF, nil
 }
 
+func libreOfficeProfileURI(dir string) string {
+	slash := filepath.ToSlash(filepath.Clean(dir))
+	if !strings.HasPrefix(slash, "/") {
+		slash = "/" + slash
+	}
+	u := url.URL{Scheme: "file", Path: slash}
+	return u.String()
+}
+
 func convertWithLibreOffice(ctx context.Context, sofficePath, inAbs, stageDir string) error {
-	cmd := exec.CommandContext(ctx, sofficePath, "--headless", "--convert-to", "pdf", "--outdir", stageDir, inAbs)
+	profileDir := filepath.Join(stageDir, ".lo-profile")
+	args := []string{
+		"-env:UserInstallation=" + libreOfficeProfileURI(profileDir),
+		"--headless",
+		"--norestore",
+		"--nofirststartwizard",
+		"--convert-to", "pdf",
+		"--outdir", stageDir,
+		inAbs,
+	}
+	cmd := exec.CommandContext(ctx, sofficePath, args...)
 	prepareCommand(cmd)
 
 	out, err := cmd.CombinedOutput()
@@ -326,7 +346,8 @@ func convertWithLibreOffice(ctx context.Context, sofficePath, inAbs, stageDir st
 }
 
 func replaceFileAtomic(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
+	err := os.Rename(src, dst)
+	if err == nil {
 		return nil
 	}
 	// On Windows os.Rename fails when dst already exists; remove and retry.
@@ -334,5 +355,5 @@ func replaceFileAtomic(src, dst string) error {
 		_ = os.Remove(dst)
 		return os.Rename(src, dst)
 	}
-	return os.Rename(src, dst)
+	return err
 }

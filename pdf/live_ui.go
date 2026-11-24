@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"embed"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	"image/png"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -25,6 +27,7 @@ import (
 	"github.com/seiortech/mtools-sdk/job"
 	"github.com/seiortech/mtools-sdk/pluginapi"
 	_ "golang.org/x/image/bmp"
+	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
 
@@ -32,11 +35,17 @@ import (
 var localesFS embed.FS
 
 const (
-	defaultPageW     = 595.0
-	defaultPageH     = 842.0
-	minZoomFactor    = 0.25
-	maxZoomFactor    = 3.0
-	defaultRailWidth = 320.0
+	defaultPageW         = 595.0
+	defaultPageH         = 842.0
+	minZoomFactor        = 0.25
+	maxZoomFactor        = 3.0
+	defaultRailWidth     = 320.0
+	maxPagePNGCacheBytes = 32 << 20 // 32 MiB compressed PNG LRU in sidecar memory
+	maxOnDiskPageAssets  = 20       // bounded active page PNGs in $MTOOLS_UI_ASSETS
+	maxImageDirectCopy   = 2 << 20  // 2 MiB direct copy threshold for image previews
+	maxImagePreviewDim   = 1400     // max preview dimension for staged images
+	maxImageDecodePixels = 64_000_000
+	maxScrollTargetY     = 1_000_000.0
 )
 
 type pageSize struct {
@@ -77,23 +86,29 @@ type liveFileItem struct {
 // LiveUI implements pluginapi.LiveUI for PDF Utility as a full-bleed
 // Sage Garden workbench with native PDF & image page previews.
 type LiveUI struct {
-	mu               sync.Mutex
-	renderMu         sync.Mutex
-	rev              uint64
-	catalog          *i18n.Catalog
-	lang             i18n.Lang
-	dataDir          string
-	appSettingsFile  string
-	sharedPDFiumDir  string
-	sharedTools      pluginapi.SharedToolsProvider
-	lastSettings     map[string]string
-	pdfiumCustomPath string
-	history          *pdfeng.HistoryStore
+	mu                sync.Mutex
+	renderMu          sync.Mutex
+	rev               uint64
+	catalog           *i18n.Catalog
+	lang              i18n.Lang
+	dataDir           string
+	appSettingsFile   string
+	sharedPDFiumDir   string
+	sharedTools       pluginapi.SharedToolsProvider
+	lastSettings      map[string]string
+	lastSession       *pluginapi.UISession
+	pdfiumCustomPath  string
+	history           *pdfeng.HistoryStore
 	renderer          pdfeng.PageRenderer
 	previewEngineErr  error
 	pdfiumDownloading bool
 	pdfiumDownloadMsg string
 	pdfiumDownloadErr string
+
+	sessionCtx    context.Context
+	sessionCancel context.CancelFunc
+	renderCtx     context.Context
+	renderCancel  context.CancelFunc
 
 	activeTab string // "merge", "split", "images", "office"
 
@@ -105,7 +120,9 @@ type LiveUI struct {
 	splitFile       *liveFileItem
 	splitMode       string // "all" or "range"
 	splitSpan       string
+	splitSpanErr    string
 	splitPageRange  string
+	splitRangeErr   string
 	splitOutputName string
 
 	// Images to PDF
@@ -117,6 +134,7 @@ type LiveUI struct {
 	officePreviewFiles []liveFileItem
 	sofficePath        string
 	officeEngine       pdfeng.OfficeEngine
+	officeStatus       pdfeng.OfficeEngineStatus
 
 	// Preview & viewport state
 	docGen             uint64
@@ -133,15 +151,17 @@ type LiveUI struct {
 	railWidth          float32
 	railCollapsed      bool
 
-	// Page bitmap & asset cache
-	pageCache       *pdfeng.PageBitmapCache
-	pageAssets      map[pageAssetKey]string
-	pageAssetFiles  map[string]string
+	// Page PNG & on-disk asset cache (bounded LRU)
+	pagePNGCache     *pdfeng.PageBytesCache
+	pageAssets       map[pageAssetKey]string
+	pageAssetFiles   map[string]string
+	pageAssetLRU     *list.List
+	pageAssetElems   map[pageAssetKey]*list.Element
 	renderSem        chan struct{}
 	inFlightRenders  map[pageAssetKey]bool
 	previewRenderErr map[pageAssetKey]string
 	zoomDebounce     *time.Timer
-	assetSeq        int
+	assetSeq         int
 
 	// Output & job state
 	outputDir        string
@@ -159,23 +179,31 @@ type LiveUI struct {
 // NewLiveUI creates a LiveUI instance for PDF Utility.
 func NewLiveUI() *LiveUI {
 	cat, _ := i18n.NewCatalogFromFS(localesFS, "locales")
+	sessCtx, sessCancel := context.WithCancel(context.Background())
+	renCtx, renCancel := context.WithCancel(sessCtx)
 	return &LiveUI{
-		catalog:         cat,
-		lang:            i18n.LangEN,
-		renderer:        pdfeng.DefaultRenderer(),
-		activeTab:       "merge",
-		mergeOutputName: "merged.pdf",
-		splitMode:       "all",
-		splitSpan:       "1",
-		splitOutputName: "extracted.pdf",
-		imageOutputName: "images.pdf",
-		currentPage:     1,
-		zoom:            1.0,
-		fitZoom:         1.0,
-		railWidth:       defaultRailWidth,
-		pageCache:       pdfeng.NewPageBitmapCache(48),
-		pageAssets:      make(map[pageAssetKey]string),
-		pageAssetFiles:  make(map[string]string),
+		catalog:          cat,
+		lang:             i18n.LangEN,
+		renderer:         pdfeng.DefaultRenderer(),
+		sessionCtx:       sessCtx,
+		sessionCancel:    sessCancel,
+		renderCtx:        renCtx,
+		renderCancel:     renCancel,
+		activeTab:        "merge",
+		mergeOutputName:  "merged.pdf",
+		splitMode:        "all",
+		splitSpan:        "1",
+		splitOutputName:  "extracted.pdf",
+		imageOutputName:  "images.pdf",
+		currentPage:      1,
+		zoom:             1.0,
+		fitZoom:          1.0,
+		railWidth:        defaultRailWidth,
+		pagePNGCache:     pdfeng.NewPageBytesCache(maxPagePNGCacheBytes),
+		pageAssets:       make(map[pageAssetKey]string),
+		pageAssetFiles:   make(map[string]string),
+		pageAssetLRU:     list.New(),
+		pageAssetElems:   make(map[pageAssetKey]*list.Element),
 		renderSem:        make(chan struct{}, 2),
 		inFlightRenders:  make(map[pageAssetKey]bool),
 		previewRenderErr: make(map[pageAssetKey]string),
@@ -200,10 +228,24 @@ func (u *LiveUI) tf(key string, args ...any) string {
 	return u.catalog.Tf(u.lang, key, args...)
 }
 
+func (u *LiveUI) resetRenderCtxLocked() {
+	if u.renderCancel != nil {
+		u.renderCancel()
+	}
+	base := u.sessionCtx
+	if base == nil {
+		base = context.Background()
+	}
+	u.renderCtx, u.renderCancel = context.WithCancel(base)
+}
+
 func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, session *pluginapi.UISession) (pluginapi.UITree, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	if session != nil {
+		u.lastSession = session
+	}
 	if params.Lang != "" {
 		u.lang = i18n.NormalizeLang(params.Lang)
 	}
@@ -212,24 +254,6 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 	}
 	if params.Viewport.Height > 0 {
 		u.viewportH = float64(params.Viewport.Height)
-	}
-	if dir := params.Settings["output_dir"]; dir != "" {
-		u.outputDir = expandHome(dir)
-	}
-	if u.outputDir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			u.outputDir = filepath.Join(home, "Downloads")
-		}
-	}
-	if sp := params.Settings["soffice_path"]; sp != "" {
-		u.sofficePath = sp
-	} else if sp := params.Settings["helper_soffice"]; sp != "" {
-		u.sofficePath = sp
-	}
-	if eng, err := pdfeng.ParseOfficeEngine(params.Settings["office_engine"]); err == nil {
-		u.officeEngine = eng
-	} else {
-		u.officeEngine = pdfeng.OfficeEngineAuto
 	}
 	if u.dataDir == "" {
 		if dd := params.Settings["plugin_data_dir"]; dd != "" {
@@ -242,11 +266,11 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 	}
 	u.appSettingsFile = params.Settings["app_settings_file"]
 	u.sharedPDFiumDir = params.Settings["shared_pdfium_dir"]
-	u.pdfiumCustomPath = strings.TrimSpace(params.Settings["pdfium_wasm_path"])
 	u.lastSettings = make(map[string]string, len(params.Settings))
 	for k, v := range params.Settings {
 		u.lastSettings[k] = v
 	}
+	u.applySettingsLocked(params.Settings)
 	if session != nil {
 		u.sharedTools = session.SharedTools()
 	} else {
@@ -258,6 +282,63 @@ func (u *LiveUI) Open(ctx context.Context, params pluginapi.UIOpenParams, sessio
 	}
 
 	return u.buildTreeLocked(), nil
+}
+
+func (u *LiveUI) applySettingsLocked(settings map[string]string) {
+	if dir := strings.TrimSpace(settings["output_dir"]); dir != "" {
+		u.outputDir = expandHome(dir)
+	}
+	if u.outputDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			u.outputDir = filepath.Join(home, "Downloads")
+		}
+	}
+	if sp := strings.TrimSpace(settings["soffice_path"]); sp != "" {
+		u.sofficePath = sp
+	} else if sp := strings.TrimSpace(settings["helper_soffice"]); sp != "" {
+		u.sofficePath = sp
+	} else if settings != nil {
+		if _, explicit := settings["soffice_path"]; explicit {
+			u.sofficePath = ""
+		}
+	}
+	if eng, err := pdfeng.ParseOfficeEngine(settings["office_engine"]); err == nil {
+		u.officeEngine = eng
+	} else {
+		u.officeEngine = pdfeng.OfficeEngineAuto
+	}
+	if v, ok := settings["pdfium_wasm_path"]; ok {
+		u.pdfiumCustomPath = strings.TrimSpace(v)
+	}
+	u.officeStatus = pdfeng.DetectOfficeEngines(u.sofficePath)
+}
+
+func (u *LiveUI) reloadSettingsFromDiskLocked(session *pluginapi.UISession) {
+	merged := make(map[string]string, len(u.lastSettings)+4)
+	for k, v := range u.lastSettings {
+		merged[k] = v
+	}
+	if u.dataDir != "" {
+		if raw, err := os.ReadFile(filepath.Join(u.dataDir, "settings.json")); err == nil {
+			var parsed map[string]any
+			if json.Unmarshal(raw, &parsed) == nil {
+				for k, v := range parsed {
+					if s, ok := v.(string); ok {
+						merged[k] = s
+					}
+				}
+			}
+		}
+	}
+	u.lastSettings = merged
+	u.applySettingsLocked(merged)
+	u.configureRendererLocked(merged)
+	if ec, ok := u.renderer.(interface{ CheckEngine() error }); ok {
+		u.previewEngineErr = ec.CheckEngine()
+	}
+	if u.previewEngineErr == nil && len(u.previewPages) > 0 {
+		u.triggerVisiblePageRendersLocked(session)
+	}
 }
 
 func (u *LiveUI) configureRendererLocked(settings map[string]string) {
@@ -321,18 +402,54 @@ func (u *LiveUI) Close(ctx context.Context) error {
 		u.jobCancel()
 		u.jobCancel = nil
 	}
-	if cr, ok := u.renderer.(pdfeng.ConfigurableRenderer); ok {
-		return cr.Close()
+	if u.renderCancel != nil {
+		u.renderCancel()
+		u.renderCancel = nil
+	}
+	if u.sessionCancel != nil {
+		u.sessionCancel()
+		u.sessionCancel = nil
+	}
+	u.clearPageAssetsLocked(u.lastSession)
+	u.clearImageAssetsLocked(u.lastSession)
+	if u.pagePNGCache != nil {
+		u.pagePNGCache.Clear()
+	}
+	if cl, ok := u.renderer.(io.Closer); ok {
+		return cl.Close()
 	}
 	return nil
 }
 
 func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginapi.UISession) error {
 	u.mu.Lock()
+	if session != nil {
+		u.lastSession = session
+	}
 	shouldRender := true
 	switch ev.Node {
+	case "settings":
+		if ev.Kind == pluginapi.UIEventChange {
+			u.reloadSettingsFromDiskLocked(session)
+		} else {
+			shouldRender = false
+		}
+	case "root":
+		if ev.Kind == pluginapi.UIEventView {
+			var w, h int
+			if _, err := fmt.Sscanf(strings.TrimSpace(ev.Value), "%dx%d", &w, &h); err == nil && w > 0 && h > 0 {
+				u.viewportW = float64(w)
+				u.viewportH = float64(h)
+				u.viewportFromScroll = false
+			}
+			shouldRender = false
+		} else {
+			shouldRender = false
+		}
 	case "retry_pdfium":
 		if ev.Kind == pluginapi.UIEventClick {
+			u.docGen++
+			u.resetRenderCtxLocked()
 			u.previewEngineErr = nil
 			u.previewRenderErr = make(map[pageAssetKey]string)
 			u.inFlightRenders = make(map[pageAssetKey]bool)
@@ -340,7 +457,7 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 			if ec, ok := u.renderer.(interface{ CheckEngine() error }); ok {
 				u.previewEngineErr = ec.CheckEngine()
 			}
-			u.pageCache.Clear()
+			u.pagePNGCache.Clear()
 			u.clearPageAssetsLocked(session)
 			u.triggerVisiblePageRendersLocked(session)
 		} else {
@@ -361,8 +478,12 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 			u.pdfiumDownloading = true
 			u.pdfiumDownloadMsg = "Downloading pdfium.wasm..."
 			u.pdfiumDownloadErr = ""
+			dlCtx := u.sessionCtx
+			if dlCtx == nil {
+				dlCtx = context.Background()
+			}
 			go func(dest string) {
-				dlErr := pdfeng.DownloadPDFiumWASM(context.Background(), dest, func(_ float64, msg string) {
+				dlErr := pdfeng.DownloadPDFiumWASM(dlCtx, dest, func(_ float64, msg string) {
 					u.mu.Lock()
 					u.pdfiumDownloadMsg = msg
 					u.mu.Unlock()
@@ -374,6 +495,8 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 					u.pdfiumDownloadErr = dlErr.Error()
 					u.pdfiumDownloadMsg = ""
 				} else {
+					u.docGen++
+					u.resetRenderCtxLocked()
 					u.pdfiumDownloadErr = ""
 					u.pdfiumDownloadMsg = ""
 					u.previewEngineErr = nil
@@ -383,7 +506,7 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 					if ec, ok := u.renderer.(interface{ CheckEngine() error }); ok {
 						u.previewEngineErr = ec.CheckEngine()
 					}
-					u.pageCache.Clear()
+					u.pagePNGCache.Clear()
 					u.clearPageAssetsLocked(session)
 					u.triggerVisiblePageRendersLocked(session)
 				}
@@ -470,11 +593,14 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 			u.inlineError = ""
 			u.resultMsg = ""
 			u.rebuildPreviewLocked(session, true)
+			u.validateSplitInputsLocked()
 		}
 	case "pdf.split.clear":
 		if ev.Kind == pluginapi.UIEventClick && !u.running {
 			u.splitFile = nil
 			u.splitPageRange = ""
+			u.splitRangeErr = ""
+			u.splitSpanErr = ""
 			u.inlineError = ""
 			u.resultMsg = ""
 			u.rebuildPreviewLocked(session, true)
@@ -483,14 +609,17 @@ func (u *LiveUI) Event(ctx context.Context, ev pluginapi.UIEvent, session *plugi
 		if ev.Kind == pluginapi.UIEventSelect && ev.Value != "" {
 			u.splitMode = ev.Value
 			u.inlineError = ""
+			u.validateSplitInputsLocked()
 		}
 	case "pdf.split.span":
 		if ev.Kind == pluginapi.UIEventChange {
 			u.splitSpan = ev.Value
+			u.validateSplitInputsLocked()
 		}
 	case "pdf.split.range":
 		if ev.Kind == pluginapi.UIEventChange {
 			u.splitPageRange = ev.Value
+			u.validateSplitInputsLocked()
 		}
 	case "pdf.split.outname":
 		if ev.Kind == pluginapi.UIEventChange {
@@ -644,6 +773,7 @@ func (u *LiveUI) handleDynamicEventLocked(ev pluginapi.UIEvent, session *plugina
 			u.currentPage = p
 			if u.activeTab == "split" && u.splitMode == "range" && len(u.previewPages) > 0 {
 				u.splitPageRange = togglePageInRange(u.splitPageRange, p, len(u.previewPages))
+				u.validateSplitInputsLocked()
 			}
 			return true
 		}
@@ -708,11 +838,27 @@ func (u *LiveUI) handleDynamicEventLocked(ev pluginapi.UIEvent, session *plugina
 	return false
 }
 
+func downscaleImageToMaxDim(src image.Image, maxDim int) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 || (w <= maxDim && h <= maxDim) {
+		return src
+	}
+	scale := float64(maxDim) / float64(max(w, h))
+	nw := max(int(math.Round(float64(w)*scale)), 1)
+	nh := max(int(math.Round(float64(h)*scale)), 1)
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	draw.BiLinear.Scale(dst, dst.Bounds(), src, b, draw.Src, nil)
+	return dst
+}
+
 func (u *LiveUI) makeItemLocked(ctx context.Context, path string, session *pluginapi.UISession, copyImageAsset bool) liveFileItem {
 	info, err := os.Stat(path)
 	sizeStr := ""
+	var fileSize int64
 	if err == nil {
-		sizeStr = formatLiveFileSize(info.Size())
+		fileSize = info.Size()
+		sizeStr = formatLiveFileSize(fileSize)
 	}
 	item := liveFileItem{
 		Path:      path,
@@ -721,34 +867,59 @@ func (u *LiveUI) makeItemLocked(ctx context.Context, path string, session *plugi
 		PageCount: -1,
 	}
 	if strings.EqualFold(filepath.Ext(path), ".pdf") && u.renderer != nil {
-		if cnt, err := u.renderer.PageCount(ctx, path); err == nil && cnt > 0 {
-			item.PageCount = cnt
-			item.PageSizes = make([]pageSize, cnt)
-			for p := 1; p <= cnt; p++ {
-				w, h, err := u.renderer.PageDimensions(ctx, path, p)
-				if err != nil || w <= 0 || h <= 0 {
+		if dims, dimErr := pdfeng.AllPageDimensions(ctx, u.renderer, path); dimErr == nil && len(dims) > 0 {
+			item.PageCount = len(dims)
+			item.PageSizes = make([]pageSize, len(dims))
+			for i, d := range dims {
+				w, h := d.Width, d.Height
+				if w <= 0 || h <= 0 {
 					w, h = defaultPageW, defaultPageH
 				}
-				item.PageSizes[p-1] = pageSize{W: w, H: h}
+				item.PageSizes[i] = pageSize{W: w, H: h}
+			}
+		} else if cnt, cntErr := u.renderer.PageCount(ctx, path); cntErr == nil && cnt > 0 {
+			item.PageCount = cnt
+			item.PageSizes = make([]pageSize, cnt)
+			for i := range item.PageSizes {
+				item.PageSizes[i] = pageSize{W: defaultPageW, H: defaultPageH}
 			}
 		}
 	}
 	if copyImageAsset {
-		if f, err := os.Open(path); err == nil {
-			if cfg, _, err := image.DecodeConfig(f); err == nil && cfg.Width > 0 && cfg.Height > 0 {
+		var cfgW, cfgH int
+		if f, openErr := os.Open(path); openErr == nil {
+			if cfg, _, decErr := image.DecodeConfig(f); decErr == nil && cfg.Width > 0 && cfg.Height > 0 {
+				cfgW, cfgH = cfg.Width, cfg.Height
 				item.ImgW = float64(cfg.Width)
 				item.ImgH = float64(cfg.Height)
 			}
 			_ = f.Close()
 		}
 		if session != nil && session.AssetsDir() != "" {
-			if data, err := os.ReadFile(path); err == nil && len(data) <= 8<<20 {
-				u.assetSeq++
-				name := fmt.Sprintf("img_%d%s", u.assetSeq, strings.ToLower(filepath.Ext(path)))
-				dst := filepath.Join(session.AssetsDir(), name)
-				if os.WriteFile(dst, data, 0600) == nil {
-					item.AssetRef = "asset:" + name
-					item.AssetFile = name
+			if fileSize > 0 && fileSize <= maxImageDirectCopy && cfgW <= maxImagePreviewDim && cfgH <= maxImagePreviewDim {
+				if data, readErr := os.ReadFile(path); readErr == nil && len(data) > 0 {
+					u.assetSeq++
+					name := fmt.Sprintf("img_%d%s", u.assetSeq, strings.ToLower(filepath.Ext(path)))
+					if writeAssetPNGBytes(session.AssetsDir(), name, data) == nil {
+						item.AssetRef = "asset:" + name
+						item.AssetFile = name
+					}
+				}
+			} else if int64(cfgW)*int64(cfgH) > 0 && int64(cfgW)*int64(cfgH) <= maxImageDecodePixels {
+				if f, openErr := os.Open(path); openErr == nil {
+					img, _, decErr := image.Decode(f)
+					_ = f.Close()
+					if decErr == nil && img != nil {
+						scaled := downscaleImageToMaxDim(img, maxImagePreviewDim)
+						if pngBytes, encErr := encodeAssetPNG(scaled); encErr == nil {
+							u.assetSeq++
+							name := fmt.Sprintf("img_%d.png", u.assetSeq)
+							if writeAssetPNGBytes(session.AssetsDir(), name, pngBytes) == nil {
+								item.AssetRef = "asset:" + name
+								item.AssetFile = name
+							}
+						}
+					}
 				}
 			}
 		}
@@ -758,6 +929,8 @@ func (u *LiveUI) makeItemLocked(ctx context.Context, path string, session *plugi
 
 func (u *LiveUI) rebuildPreviewLocked(session *pluginapi.UISession, resetScroll bool) {
 	u.docGen++
+	u.resetRenderCtxLocked()
+	u.inFlightRenders = make(map[pageAssetKey]bool)
 	u.clearPageAssetsLocked(session)
 	u.previewPages = nil
 
@@ -920,7 +1093,8 @@ func (u *LiveUI) pageTopYLocked(globalPage int) float64 {
 	y := topPad
 	z := u.effectiveZoomLocked()
 	for i := 1; i < globalPage && i <= len(u.previewPages); i++ {
-		y += u.previewPages[i-1].H*z + pageGap
+		ph := float64(min(max(int(math.Round(u.previewPages[i-1].H*z)), 100), 8192))
+		y += ph + pageGap
 	}
 	return y
 }
@@ -938,6 +1112,9 @@ func (u *LiveUI) jumpToPageLocked(globalPage int, session *pluginapi.UISession) 
 	targetY := u.pageTopYLocked(globalPage) - 24
 	if targetY < 0 {
 		targetY = 0
+	}
+	if targetY > maxScrollTargetY {
+		targetY = maxScrollTargetY
 	}
 	u.scrollSeq++
 	u.targetScrollY = targetY
@@ -986,7 +1163,7 @@ func (u *LiveUI) handleViewportScrollLocked(val string, session *pluginapi.UISes
 	currY := topPad
 	found := 1
 	for i := 1; i <= len(u.previewPages); i++ {
-		ph := u.previewPages[i-1].H * z
+		ph := float64(min(max(int(math.Round(u.previewPages[i-1].H*z)), 100), 8192))
 		if focusY >= currY && focusY <= currY+ph+pageGap {
 			found = i
 			break
@@ -1005,13 +1182,47 @@ func (u *LiveUI) handleViewportScrollLocked(val string, session *pluginapi.UISes
 }
 
 func (u *LiveUI) handleViewportZoomLocked(val string, session *pluginapi.UISession) bool {
-	f, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
-	if err != nil || f == 0 {
+	factor, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+	if err != nil || factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
 		return false
 	}
-	nextZoom := u.effectiveZoomLocked() * (1 + f*0.02)
+	nextZoom := u.effectiveZoomLocked() * factor
 	u.setZoomLocked(nextZoom, session)
 	return true
+}
+
+func (u *LiveUI) isPageRenderWantedLocked(pdfPath string, pdfPage int, scale1000 int) bool {
+	if len(u.previewPages) == 0 {
+		return false
+	}
+	curScale1000 := int(math.Round(pdfeng.QuantizeRenderScale(u.effectiveZoomLocked()) * 1000))
+	if scale1000 != curScale1000 {
+		return false
+	}
+	start := max(u.currentPage-4, 1)
+	end := min(u.currentPage+4, len(u.previewPages))
+	for p := start; p <= end; p++ {
+		pg := u.previewPages[p-1]
+		if pg.Kind == "pdf" && pg.SourcePath == pdfPath && pg.PDFPage == pdfPage {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *LiveUI) isAssetVisibleLocked(key pageAssetKey) bool {
+	if key.docGen != u.docGen || len(u.previewPages) == 0 {
+		return false
+	}
+	start := max(u.currentPage-4, 1)
+	end := min(u.currentPage+4, len(u.previewPages))
+	for p := start; p <= end; p++ {
+		pg := u.previewPages[p-1]
+		if pg.Kind == "pdf" && pg.SourcePath == key.sourcePath && pg.PDFPage == key.pageNum {
+			return true
+		}
+	}
+	return false
 }
 
 func (u *LiveUI) triggerVisiblePageRendersLocked(session *pluginapi.UISession) {
@@ -1019,14 +1230,8 @@ func (u *LiveUI) triggerVisiblePageRendersLocked(session *pluginapi.UISession) {
 		return
 	}
 	scale := pdfeng.QuantizeRenderScale(u.effectiveZoomLocked())
-	start := u.currentPage - 2
-	if start < 1 {
-		start = 1
-	}
-	end := u.currentPage + 2
-	if end > len(u.previewPages) {
-		end = len(u.previewPages)
-	}
+	start := max(u.currentPage-2, 1)
+	end := min(u.currentPage+2, len(u.previewPages))
 	for p := start; p <= end; p++ {
 		pg := u.previewPages[p-1]
 		if pg.Kind == "pdf" {
@@ -1047,13 +1252,43 @@ func (u *LiveUI) requestPageRenderLocked(pdfPath string, pdfPage int, scale floa
 		scale1000:  scale1000,
 	}
 	if _, ok := u.pageAssets[key]; ok {
+		if elem, hasElem := u.pageAssetElems[key]; hasElem {
+			u.pageAssetLRU.MoveToFront(elem)
+		}
 		return
 	}
 	if u.inFlightRenders[key] {
 		return
 	}
-	if cachedImg, ok := u.pageCache.Get(pdfPath, pdfPage, scale); ok {
-		u.storeRenderedPageAssetLocked(key, cachedImg, session)
+
+	assetsDir := ""
+	if session != nil {
+		assetsDir = session.AssetsDir()
+	}
+
+	if cachedPNG, ok := u.pagePNGCache.Get(pdfPath, pdfPage, scale); ok {
+		if assetsDir == "" {
+			return
+		}
+		u.inFlightRenders[key] = true
+		u.assetSeq++
+		fileName := fmt.Sprintf("page-%d-g%d-s%d-v%d.png", key.pageNum, key.docGen, key.scale1000, u.assetSeq)
+		docGen := u.docGen
+		go func() {
+			err := writeAssetPNGBytes(assetsDir, fileName, cachedPNG)
+			u.mu.Lock()
+			delete(u.inFlightRenders, key)
+			if err != nil || u.docGen != docGen {
+				if err == nil {
+					_ = os.Remove(filepath.Join(assetsDir, fileName))
+				}
+				u.mu.Unlock()
+				return
+			}
+			u.registerPageAssetLocked(key, fileName, session)
+			u.mu.Unlock()
+			_ = u.renderAndSend(session)
+		}()
 		return
 	}
 
@@ -1061,15 +1296,35 @@ func (u *LiveUI) requestPageRenderLocked(pdfPath string, pdfPage int, scale floa
 	docGen := u.docGen
 	renderer := u.renderer
 	sem := u.renderSem
+	rCtx := u.renderCtx
+	if rCtx == nil {
+		rCtx = context.Background()
+	}
 	go func() {
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-rCtx.Done():
+			u.mu.Lock()
+			delete(u.inFlightRenders, key)
+			u.mu.Unlock()
+			return
+		}
 		defer func() { <-sem }()
 
-		img, err := renderer.RenderPage(context.Background(), pdfPath, pdfPage, scale)
+		u.mu.Lock()
+		stillWanted := u.docGen == docGen && u.isPageRenderWantedLocked(pdfPath, pdfPage, scale1000)
+		if !stillWanted {
+			delete(u.inFlightRenders, key)
+			u.mu.Unlock()
+			return
+		}
+		u.mu.Unlock()
+
+		img, err := renderer.RenderPage(rCtx, pdfPath, pdfPage, scale)
 		if err != nil {
 			u.mu.Lock()
 			delete(u.inFlightRenders, key)
-			if u.docGen != docGen {
+			if u.docGen != docGen || errors.Is(err, context.Canceled) {
 				u.mu.Unlock()
 				return
 			}
@@ -1082,31 +1337,47 @@ func (u *LiveUI) requestPageRenderLocked(pdfPath string, pdfPage int, scale floa
 			_ = u.renderAndSend(session)
 			return
 		}
-		if img == nil {
+		if img == nil || rCtx.Err() != nil {
 			u.mu.Lock()
 			delete(u.inFlightRenders, key)
 			u.mu.Unlock()
 			return
 		}
 
-		var pngBytes []byte
-		if session != nil && session.AssetsDir() != "" {
-			pngBytes, _ = encodeAssetPNG(img)
+		pngBytes, encErr := encodeAssetPNG(img)
+		if encErr != nil || len(pngBytes) == 0 || rCtx.Err() != nil {
+			u.mu.Lock()
+			delete(u.inFlightRenders, key)
+			u.mu.Unlock()
+			return
+		}
+
+		var fileName string
+		if assetsDir != "" {
+			u.mu.Lock()
+			u.assetSeq++
+			seq := u.assetSeq
+			u.mu.Unlock()
+			fileName = fmt.Sprintf("page-%d-g%d-s%d-v%d.png", key.pageNum, key.docGen, key.scale1000, seq)
+			if err := writeAssetPNGBytes(assetsDir, fileName, pngBytes); err != nil {
+				fileName = ""
+			}
 		}
 
 		u.mu.Lock()
 		delete(u.inFlightRenders, key)
 		if u.docGen != docGen {
+			if fileName != "" && assetsDir != "" {
+				_ = os.Remove(filepath.Join(assetsDir, fileName))
+			}
 			u.mu.Unlock()
 			return
 		}
 		u.previewEngineErr = nil
 		delete(u.previewRenderErr, key)
-		u.pageCache.Put(pdfPath, pdfPage, scale, img)
-		if len(pngBytes) > 0 {
-			u.storeRenderedPageAssetBytesLocked(key, pngBytes, session)
-		} else {
-			u.storeRenderedPageAssetLocked(key, img, session)
+		u.pagePNGCache.Put(pdfPath, pdfPage, scale, pngBytes)
+		if fileName != "" {
+			u.registerPageAssetLocked(key, fileName, session)
 		}
 		u.mu.Unlock()
 
@@ -1114,29 +1385,50 @@ func (u *LiveUI) requestPageRenderLocked(pdfPath string, pdfPage int, scale floa
 	}()
 }
 
-func (u *LiveUI) storeRenderedPageAssetLocked(key pageAssetKey, img image.Image, session *pluginapi.UISession) {
-	if session == nil || session.AssetsDir() == "" || img == nil {
-		return
-	}
-	b, err := encodeAssetPNG(img)
-	if err != nil {
-		return
-	}
-	u.storeRenderedPageAssetBytesLocked(key, b, session)
-}
-
-func (u *LiveUI) storeRenderedPageAssetBytesLocked(key pageAssetKey, pngBytes []byte, session *pluginapi.UISession) {
-	if session == nil || session.AssetsDir() == "" || len(pngBytes) == 0 {
-		return
-	}
-	u.assetSeq++
-	fileName := fmt.Sprintf("page-%d-g%d-s%d-v%d.png", key.pageNum, key.docGen, key.scale1000, u.assetSeq)
-	if err := writeAssetPNGBytes(session.AssetsDir(), fileName, pngBytes); err != nil {
-		return
-	}
+func (u *LiveUI) registerPageAssetLocked(key pageAssetKey, fileName string, session *pluginapi.UISession) {
 	ref := "asset:" + fileName
+	if oldRef, exists := u.pageAssets[key]; exists {
+		if oldFn, ok := u.pageAssetFiles[oldRef]; ok && oldFn != fileName && session != nil && session.AssetsDir() != "" {
+			_ = os.Remove(filepath.Join(session.AssetsDir(), oldFn))
+		}
+		delete(u.pageAssetFiles, oldRef)
+	}
 	u.pageAssets[key] = ref
 	u.pageAssetFiles[ref] = fileName
+	if elem, ok := u.pageAssetElems[key]; ok {
+		u.pageAssetLRU.MoveToFront(elem)
+	} else {
+		u.pageAssetElems[key] = u.pageAssetLRU.PushFront(key)
+	}
+	u.evictPageAssetsLocked(session)
+}
+
+func (u *LiveUI) evictPageAssetsLocked(session *pluginapi.UISession) {
+	if u.pageAssetLRU.Len() <= maxOnDiskPageAssets {
+		return
+	}
+	dir := ""
+	if session != nil {
+		dir = session.AssetsDir()
+	}
+	for elem := u.pageAssetLRU.Back(); elem != nil && u.pageAssetLRU.Len() > maxOnDiskPageAssets; {
+		prev := elem.Prev()
+		k := elem.Value.(pageAssetKey)
+		if u.isAssetVisibleLocked(k) {
+			elem = prev
+			continue
+		}
+		u.pageAssetLRU.Remove(elem)
+		delete(u.pageAssetElems, k)
+		if ref, ok := u.pageAssets[k]; ok {
+			if fn, hasFn := u.pageAssetFiles[ref]; hasFn && dir != "" {
+				_ = os.Remove(filepath.Join(dir, fn))
+			}
+			delete(u.pageAssetFiles, ref)
+			delete(u.pageAssets, k)
+		}
+		elem = prev
+	}
 }
 
 func (u *LiveUI) pageAssetRefLocked(pg previewPage) string {
@@ -1178,6 +1470,10 @@ func (u *LiveUI) clearPageAssetsLocked(session *pluginapi.UISession) {
 	}
 	u.pageAssets = make(map[pageAssetKey]string)
 	u.pageAssetFiles = make(map[string]string)
+	if u.pageAssetLRU != nil {
+		u.pageAssetLRU.Init()
+	}
+	u.pageAssetElems = make(map[pageAssetKey]*list.Element)
 	u.previewRenderErr = make(map[pageAssetKey]string)
 }
 
@@ -1205,6 +1501,26 @@ func (u *LiveUI) defaultOutputPathLocked() string {
 	}
 }
 
+func (u *LiveUI) validateSplitInputsLocked() {
+	u.splitRangeErr = ""
+	u.splitSpanErr = ""
+	maxPage := 0
+	if u.splitFile != nil && u.splitFile.PageCount > 0 {
+		maxPage = u.splitFile.PageCount
+	}
+	if u.splitMode == "range" {
+		if strings.TrimSpace(u.splitPageRange) != "" {
+			if _, errMsg := validatePageRangeSpec(u.splitPageRange, maxPage); errMsg != "" {
+				u.splitRangeErr = errMsg
+			}
+		}
+	} else {
+		if _, errMsg := validateSplitSpanSpec(u.splitSpan); errMsg != "" {
+			u.splitSpanErr = errMsg
+		}
+	}
+}
+
 func (u *LiveUI) canRunLocked() bool {
 	if u.running {
 		return false
@@ -1217,9 +1533,12 @@ func (u *LiveUI) canRunLocked() bool {
 			return false
 		}
 		if u.splitMode == "range" {
-			return len(parsePageRanges(u.splitPageRange)) > 0
+			maxPage := max(u.splitFile.PageCount, 0)
+			ranges, errMsg := validatePageRangeSpec(u.splitPageRange, maxPage)
+			return errMsg == "" && len(ranges) > 0
 		}
-		return true
+		_, errMsg := validateSplitSpanSpec(u.splitSpan)
+		return errMsg == ""
 	case "images":
 		return len(u.imageFiles) >= 1
 	case "office":
@@ -1256,9 +1575,13 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 			return
 		}
 		if u.splitMode == "range" {
-			ranges := parsePageRanges(u.splitPageRange)
-			if len(ranges) == 0 {
-				u.inlineError = "Enter a valid page selection (e.g. 1-3, 5)."
+			ranges, errMsg := validatePageRangeSpec(u.splitPageRange, max(u.splitFile.PageCount, 0))
+			if errMsg != "" || len(ranges) == 0 {
+				if errMsg == "" {
+					errMsg = "Enter a valid page selection (e.g. 1-3, 5)."
+				}
+				u.splitRangeErr = errMsg
+				u.inlineError = errMsg
 				return
 			}
 			outFile := explicitOutFile
@@ -1272,9 +1595,11 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 				PageRanges: ranges,
 			}
 		} else {
-			span := 1
-			if n, err := strconv.Atoi(strings.TrimSpace(u.splitSpan)); err == nil && n > 0 {
-				span = n
+			span, errMsg := validateSplitSpanSpec(u.splitSpan)
+			if errMsg != "" {
+				u.splitSpanErr = errMsg
+				u.inlineError = errMsg
+				return
 			}
 			pdfJob = pdfeng.PDFJob{
 				Op:         pdfeng.OpSplit,
@@ -1321,7 +1646,11 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 		return
 	}
 
-	jobCtx, cancel := context.WithCancel(ctx)
+	baseCtx := ctx
+	if u.sessionCtx != nil {
+		baseCtx = u.sessionCtx
+	}
+	jobCtx, cancel := context.WithCancel(baseCtx)
 	u.jobGen++
 	curGen := u.jobGen
 	u.jobCancel = cancel
@@ -1382,7 +1711,7 @@ func (u *LiveUI) startJobLocked(ctx context.Context, session *pluginapi.UISessio
 			if pdfJob.Op == pdfeng.OpOffice && len(res.Outputs) > 0 {
 				var converted []liveFileItem
 				for _, outPDF := range res.Outputs {
-					converted = append(converted, u.makeItemLocked(context.Background(), outPDF, session, false))
+					converted = append(converted, u.makeItemLocked(jobCtx, outPDF, session, false))
 				}
 				u.officePreviewFiles = converted
 				u.rebuildPreviewLocked(session, true)
@@ -1483,6 +1812,52 @@ func parsePageRanges(raw string) []string {
 		}
 	}
 	return out
+}
+
+func validateSplitSpanSpec(raw string) (int, string) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 1, ""
+	}
+	n, err := strconv.Atoi(trimmed)
+	if err != nil || n < 1 {
+		return 0, "Pages per file must be a whole number >= 1."
+	}
+	return n, ""
+}
+
+func validatePageRangeSpec(raw string, maxPage int) ([]string, string) {
+	parts := parsePageRanges(raw)
+	if len(parts) == 0 {
+		return nil, ""
+	}
+	for _, part := range parts {
+		if strings.Contains(part, "-") {
+			bounds := strings.Split(part, "-")
+			if len(bounds) != 2 {
+				return nil, fmt.Sprintf("Invalid page range %q. Use e.g. 1-3, 5.", part)
+			}
+			sStr := strings.TrimSpace(bounds[0])
+			eStr := strings.TrimSpace(bounds[1])
+			start, e1 := strconv.Atoi(sStr)
+			end, e2 := strconv.Atoi(eStr)
+			if e1 != nil || e2 != nil || start < 1 || end < 1 {
+				return nil, fmt.Sprintf("Invalid page range %q. Page numbers must be >= 1.", part)
+			}
+			if maxPage > 0 && (start > maxPage || end > maxPage) {
+				return nil, fmt.Sprintf("Page range %q exceeds document length (%d pages).", part, maxPage)
+			}
+			continue
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil || p < 1 {
+			return nil, fmt.Sprintf("Invalid page number %q. Use e.g. 1-3, 5.", part)
+		}
+		if maxPage > 0 && p > maxPage {
+			return nil, fmt.Sprintf("Page %d exceeds document length (%d pages).", p, maxPage)
+		}
+	}
+	return parts, ""
 }
 
 func parseIncludedPages(raw string, maxPage int) map[int]bool {

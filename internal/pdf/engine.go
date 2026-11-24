@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -39,6 +40,9 @@ func MergePDFs(ctx context.Context, inFiles []string, outFile string) error {
 }
 
 // SplitPDF splits a PDF into chunks of span pages (one page when span <= 0).
+// Outputs are staged into a temporary directory on the destination filesystem
+// so failures/cancellations cannot pollute outDir and pre-existing files are
+// never reported as outputs of this operation.
 func SplitPDF(ctx context.Context, inFile string, outDir string, span int) ([]string, error) {
 	if inFile == "" {
 		return nil, ErrEmptyInput
@@ -52,19 +56,42 @@ func SplitPDF(ctx context.Context, inFile string, outDir string, span int) ([]st
 	if span <= 0 {
 		span = 1
 	}
-	if err := api.SplitFile(ctx, inFile, outDir, span, model.NewStatelessConfiguration()); err != nil {
+	staging, err := os.MkdirTemp(outDir, ".mtools-split-*")
+	if err != nil {
+		return nil, fmt.Errorf("create staging directory: %w", err)
+	}
+	defer os.RemoveAll(staging)
+
+	if err := api.SplitFile(ctx, inFile, staging, span, model.NewStatelessConfiguration()); err != nil {
 		return nil, err
 	}
-	baseName := strings.TrimSuffix(filepath.Base(inFile), filepath.Ext(inFile))
-	entries, err := os.ReadDir(outDir)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(staging)
 	if err != nil {
 		return nil, err
 	}
-	var outputs []string
+	var names []string
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), baseName+"_") && strings.HasSuffix(entry.Name(), ".pdf") {
-			outputs = append(outputs, filepath.Join(outDir, entry.Name()))
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".pdf") {
+			names = append(names, entry.Name())
 		}
+	}
+	sort.Strings(names)
+
+	outputs := make([]string, 0, len(names))
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		src := filepath.Join(staging, name)
+		dst := filepath.Join(outDir, name)
+		if err := replaceFileAtomic(src, dst); err != nil {
+			return nil, fmt.Errorf("publish split output %s: %w", name, err)
+		}
+		outputs = append(outputs, dst)
 	}
 	return outputs, nil
 }
@@ -111,7 +138,7 @@ func ImagesToPDF(ctx context.Context, imgFiles []string, outFile string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.Rename(tempFile, outFile)
+	return replaceFileAtomic(tempFile, outFile)
 }
 
 // GetPageCount uses stateless configuration instead of pdfcpu's user config directory.
